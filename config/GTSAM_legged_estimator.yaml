@@ -1,0 +1,75 @@
+GTSAM_legged_estimator:
+  ros__parameters:
+    topics:
+      imu: /imu
+      foot: /spot/status/feet
+      foot_type: spot_msgs/msg/FootStateArray
+      joint_states: /joint_states
+      read_joint_states: true
+      # Outputs use fixed RViz topics: /legged_estimator/{odom,path,foot_contacts}.
+      odom_prefix: /legged_estimator
+
+    frames:
+      odom: odom
+      base_link: base_link
+
+    calibration:
+      foot_names: [fl, fr, hl, hr]
+
+      # Per-foot additive offset [x,y,z] in body frame, flattened by foot order.
+      leg_imu_offsets: [
+        0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0
+      ]
+
+      # body_P_imu is the IMU pose expressed in the robot body frame.
+      # Quaternion uses ROS order [x, y, z, w].
+      body_p_imu_xyz: [0.0, 0.0, 0.0]
+      body_q_imu_xyzw: [0.0, 0.0, 0.0, 1.0]
+
+      use_joint_fk_for_body_point: true
+      joint_fk_fallback_to_msg_body_point: true
+      joint_fk_max_joint_age_seconds: 0.05
+      spot_fk_position_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+
+    conversion:
+      # FootState.msg defines CONTACT_MADE=1 and CONTACT_LOST=2.
+      contact_stream_mode: transition
+      contact_state_value: 1
+      contact_made_code: 1
+      contact_lost_code: 2
+
+    estimator:
+      variants: [invariant_ekf]  # exactly one of: invariant_ekf, invariant_graph, fixed_lag_single_bias, fixed_lag_combined_bias
+      output_dir: ./outputs/live
+      max_duration_seconds: 0.0
+      lag_seconds: 1.0
+      max_dead_reckoning_seconds: 0.100
+      sigma_acc: 0.020
+      bias_acc_random_walk_sigma: 0.005
+      bias_omega_random_walk_sigma: 0.0001
+      contact_sigma_xy: 0.030
+      contact_sigma_z: 0.020
+      use_robust_contact_noise: false
+      robust_contact_huber_k: 2.0
+      marginalize_leaving_foot: true
+      disable_full_contact_initialization: false
+      startup_bias_window_seconds: 1.0
+      startup_timeout_seconds: 5.0
+
+    qos:
+      reliability: best_effort
+      depth: 1000
+      reorder_delay_seconds: 0.1
+
+    publish_odom: true
+    publish_path: true
+    publish_foot_contacts: true
+    foot_contact_touchdowns_only: false
+    foot_contact_marker_scale: 0.12
+    foot_contact_marker_z_offset: 0.03
+    foot_contact_max_points: 5000
+    path_publish_decimation: 10
+    path_max_poses: 10000

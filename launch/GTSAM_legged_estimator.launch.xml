@@ -1,0 +1,21 @@
+<launch>
+  <arg name="params_file" default="$(find-pkg-share gtsam_legged_replay_example)/config/GTSAM_legged_estimator.yaml"/>
+  <arg name="output_dir" default="./outputs/live"/>
+  <arg name="use_rviz" default="true"/>
+  <arg name="rviz_config" default="$(find-pkg-share gtsam_legged_replay_example)/config/GTSAM_legged_estimator.rviz"/>
+
+  <node pkg="gtsam_legged_replay_example"
+        exec="LeggedEstimatorRos2Node"
+        name="GTSAM_legged_estimator"
+        output="screen">
+    <param from="$(var params_file)"/>
+    <param name="estimator.output_dir" value="$(var output_dir)"/>
+  </node>
+
+  <node pkg="rviz2"
+        exec="rviz2"
+        name="legged_estimator_rviz"
+        output="screen"
+        args="-d $(var rviz_config)"
+        if="$(var use_rviz)"/>
+</launch>
