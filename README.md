@@ -23,9 +23,7 @@ Required:
 This package was tested with a source build of GTSAM from the `develop` branch.
 The tested build reports `GTSAM_VERSION_STRING "4.3a1"` and
 `GTSAM_VERSION_NUMERIC=40300`; this is a development build, not an official
-GTSAM release. The package links against both `gtsam` and `gtsam_unstable`, but
-there is no separate `GTSAM_UNSTABLE` install step when GTSAM is installed from
-source with its standard CMake build.
+GTSAM release.
 
 ## Build
 
