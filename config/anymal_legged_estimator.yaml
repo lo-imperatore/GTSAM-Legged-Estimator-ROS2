@@ -1,16 +1,11 @@
 GTSAM_legged_estimator:
   ros__parameters:
     robot:
-      type: spot
+      type: anymal
 
     topics:
-      imu: /imu
-      foot: /spot/status/feet
-      foot_type: spot_msgs/msg/FootStateArray
+      imu: /anymal/imu
       anymal_state: /anymal/state_estimator/anymal_state
-      use_anymal_contacts: false
-      joint_states: /joint_states
-      read_joint_states: true
       # Outputs use fixed RViz topics: /legged_estimator/{odom,path,foot_contacts}.
       odom_prefix: /legged_estimator
 
@@ -34,17 +29,7 @@ GTSAM_legged_estimator:
       body_p_imu_xyz: [0.0, 0.0, 0.0]
       body_q_imu_xyzw: [0.0, 0.0, 0.0, 1.0]
 
-      use_joint_fk_for_body_point: true
-      joint_fk_fallback_to_msg_body_point: true
-      joint_fk_max_joint_age_seconds: 0.05
-      spot_fk_position_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-
     conversion:
-      # FootState.msg defines CONTACT_MADE=1 and CONTACT_LOST=2.
-      contact_stream_mode: transition
-      contact_state_value: 1
-      contact_made_code: 1
-      contact_lost_code: 2
       anymal_slipping_is_contact: true
       anymal_require_state_ok: false
 

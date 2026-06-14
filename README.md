@@ -61,6 +61,10 @@ The experiments use the dataset from
 The GaRLILEO dataset contains ROS 2 bag sequences collected with a Boston
 Dynamics Spot robot equipped with IMU, leg kinematics, and radar sensors.
 
+For the ANYmal robot, the Grand Tour dataset is expected to be available in
+ROS 2 soon. The ANYmal state message used by this package is available at
+[AnymalState.msg](https://github.com/leggedrobotics/holistic_fusion/blob/main/ros/graph_msf_anymal_msgs/msg/AnymalState.msg).
+
 ## Run
 
 In one terminal, replay a GaRLILEO ROS 2 bag:
@@ -79,14 +83,27 @@ source install/setup.bash
 ros2 launch gtsam_legged_replay_example GTSAM_legged_estimator.launch.xml
 ```
 
+Select the robot-specific config from launch with `robot_type`:
+
+```bash
+ros2 launch gtsam_legged_replay_example GTSAM_legged_estimator.launch.xml robot_type:=spot
+ros2 launch gtsam_legged_replay_example GTSAM_legged_estimator.launch.xml robot_type:=anymal
+```
+
 ## Input Topics
 
-Defaults are defined in `config/GTSAM_legged_estimator.yaml`.
+Robot-specific defaults are defined in `config/spot_legged_estimator.yaml` and
+`config/anymal_legged_estimator.yaml`.
 
 ```text
-/imu                sensor_msgs/msg/Imu
-/spot/status/feet  spot_msgs/msg/FootStateArray
-/joint_states      sensor_msgs/msg/JointState
+Spot:
+  /imu                sensor_msgs/msg/Imu
+  /spot/status/feet  spot_msgs/msg/FootStateArray
+  /joint_states      sensor_msgs/msg/JointState
+
+ANYmal:
+  /anymal/imu                             sensor_msgs/msg/Imu
+  /anymal/state_estimator/anymal_state   anymal_msgs/msg/AnymalState
 ```
 
 When `topics.read_joint_states: true`, the node uses `/joint_states` to compute

@@ -19,21 +19,16 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <rclcpp/serialization.hpp>
 #include <rclcpp/serialized_message.hpp>
-#include <rclcpp/typesupport_helpers.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
-
-#include <rosidl_runtime_cpp/message_initialization.hpp>
-#include <rosidl_typesupport_introspection_cpp/field_types.hpp>
-#include <rosidl_typesupport_introspection_cpp/message_introspection.hpp>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -41,7 +36,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <optional>
 #include <queue>
 #include <sstream>
@@ -50,13 +44,14 @@
 #include <utility>
 #include <vector>
 
+#include "include/AnymalContactAdapter.h"
 #include "include/LeggedEstimatorCore.h"
+#include "include/SpotContactAdapter.h"
 
 namespace gtsam {
 namespace {
 
 namespace fs = std::filesystem;
-namespace introspection = rosidl_typesupport_introspection_cpp;
 
 using sensor_msgs::msg::Imu;
 using sensor_msgs::msg::JointState;
@@ -126,114 +121,6 @@ enum class ContactPacketStatus {
   kUsedPeriodic,
 };
 
-const introspection::MessageMember* findMember(
-    const introspection::MessageMembers* members, const std::string& name) {
-  for (uint32_t index = 0; index < members->member_count_; ++index) {
-    const introspection::MessageMember& member = members->members_[index];
-    if (member.name_ == name) {
-      return &member;
-    }
-  }
-  return nullptr;
-}
-
-const void* fieldPtr(const void* message,
-                     const introspection::MessageMember* member) {
-  return static_cast<const uint8_t*>(message) + member->offset_;
-}
-
-const introspection::MessageMembers* nestedMembers(
-    const introspection::MessageMember* member) {
-  if (member == nullptr || member->type_id_ != introspection::ROS_TYPE_MESSAGE ||
-      member->members_ == nullptr || member->members_->data == nullptr) {
-    throw std::runtime_error("Expected nested ROS message field");
-  }
-  return static_cast<const introspection::MessageMembers*>(
-      member->members_->data);
-}
-
-double readNumericField(const void* message,
-                        const introspection::MessageMembers* members,
-                        const std::string& name) {
-  const introspection::MessageMember* member = findMember(members, name);
-  if (member == nullptr) {
-    throw std::runtime_error("Missing numeric field: " + name);
-  }
-  const void* ptr = fieldPtr(message, member);
-  switch (member->type_id_) {
-    case introspection::ROS_TYPE_FLOAT:
-      return static_cast<double>(*static_cast<const float*>(ptr));
-    case introspection::ROS_TYPE_DOUBLE:
-      return *static_cast<const double*>(ptr);
-    case introspection::ROS_TYPE_UINT8:
-    case introspection::ROS_TYPE_OCTET:
-      return static_cast<double>(*static_cast<const uint8_t*>(ptr));
-    case introspection::ROS_TYPE_INT8:
-      return static_cast<double>(*static_cast<const int8_t*>(ptr));
-    case introspection::ROS_TYPE_UINT16:
-      return static_cast<double>(*static_cast<const uint16_t*>(ptr));
-    case introspection::ROS_TYPE_INT16:
-      return static_cast<double>(*static_cast<const int16_t*>(ptr));
-    case introspection::ROS_TYPE_UINT32:
-      return static_cast<double>(*static_cast<const uint32_t*>(ptr));
-    case introspection::ROS_TYPE_INT32:
-      return static_cast<double>(*static_cast<const int32_t*>(ptr));
-    case introspection::ROS_TYPE_UINT64:
-      return static_cast<double>(*static_cast<const uint64_t*>(ptr));
-    case introspection::ROS_TYPE_INT64:
-      return static_cast<double>(*static_cast<const int64_t*>(ptr));
-    default:
-      throw std::runtime_error("Field is not numeric: " + name);
-  }
-}
-
-double stampToSec(const void* message,
-                  const introspection::MessageMembers* members) {
-  const introspection::MessageMember* headerMember = findMember(members, "header");
-  if (headerMember == nullptr) {
-    throw std::runtime_error("FootStateArray is missing header");
-  }
-  const void* header = fieldPtr(message, headerMember);
-  const introspection::MessageMembers* headerMembers = nestedMembers(headerMember);
-  const introspection::MessageMember* stampMember =
-      findMember(headerMembers, "stamp");
-  if (stampMember == nullptr) {
-    throw std::runtime_error("Header is missing stamp");
-  }
-  const void* stamp = fieldPtr(header, stampMember);
-  const introspection::MessageMembers* stampMembers = nestedMembers(stampMember);
-  const double sec = readNumericField(stamp, stampMembers, "sec");
-  const double nanosec = readNumericField(stamp, stampMembers, "nanosec");
-  return sec + nanosec * 1e-9;
-}
-
-class DynamicRosMessage {
- public:
-  explicit DynamicRosMessage(const introspection::MessageMembers* members)
-      : members_(members) {
-    data_ = ::operator new(members_->size_of_);
-    members_->init_function(data_,
-                            rosidl_runtime_cpp::MessageInitialization::ALL);
-  }
-
-  ~DynamicRosMessage() {
-    if (data_ != nullptr) {
-      members_->fini_function(data_);
-      ::operator delete(data_);
-    }
-  }
-
-  DynamicRosMessage(const DynamicRosMessage&) = delete;
-  DynamicRosMessage& operator=(const DynamicRosMessage&) = delete;
-
-  void* data() { return data_; }
-  const void* data() const { return data_; }
-
- private:
-  const introspection::MessageMembers* members_ = nullptr;
-  void* data_ = nullptr;
-};
-
 std::vector<double> checkedDoubleVector(const std::vector<double>& value,
                                         size_t expectedSize,
                                         const std::string& name) {
@@ -258,6 +145,17 @@ std::vector<double> checkedQuaternionXyzw(const std::vector<double>& value,
     throw std::runtime_error(name + " must not be a zero quaternion");
   }
   return quaternion;
+}
+
+std::string normalizeRobotType(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](const unsigned char c) {
+                   return static_cast<char>(std::tolower(c));
+                 });
+  if (value != "spot" && value != "anymal") {
+    throw std::runtime_error("robot.type must be either 'spot' or 'anymal'");
+  }
+  return value;
 }
 
 class VariantRunner {
@@ -508,13 +406,11 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
   explicit LeggedEstimatorRos2Node(const rclcpp::NodeOptions& options)
       : Node("GTSAM_legged_estimator", options) {
     readParameters();
-    setupFootTypeSupport();
     setupRosInterfaces();
 
     logStartupConfiguration();
-    RCLCPP_INFO(get_logger(),
-                "C++ live estimator subscribed: imu=%s, foot=%s (%s)",
-                imuTopic_.c_str(), footTopic_.c_str(), footType_.c_str());
+    RCLCPP_INFO(get_logger(), "C++ live estimator subscribed: robot=%s, imu=%s",
+                robotType_.c_str(), imuTopic_.c_str());
   }
 
   ~LeggedEstimatorRos2Node() override { finish(); }
@@ -536,13 +432,25 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
  private:
   void readParameters() {
     imuTopic_ = declare_parameter<std::string>("topics.imu", "/imu");
-    footTopic_ =
-        declare_parameter<std::string>("topics.foot", "/spot/status/feet");
-    footType_ = declare_parameter<std::string>(
-        "topics.foot_type", "spot_msgs/msg/FootStateArray");
-    jointStatesTopic_ =
-        declare_parameter<std::string>("topics.joint_states", "/joint_states");
-    readJointStates_ = declare_parameter<bool>("topics.read_joint_states", true);
+    const bool legacyUseAnymalContacts =
+        declare_parameter<bool>("topics.use_anymal_contacts", false);
+    robotType_ = normalizeRobotType(declare_parameter<std::string>(
+        "robot.type", legacyUseAnymalContacts ? "anymal" : "spot"));
+    SpotContactAdapter::Options spotOptions;
+    AnymalContactAdapter::Options anymalOptions;
+    if (robotType_ == "spot") {
+      spotFootTopic_ =
+          declare_parameter<std::string>("topics.foot", "/spot/status/feet");
+      spotFootType_ = declare_parameter<std::string>(
+          "topics.foot_type", "spot_msgs/msg/FootStateArray");
+      jointStatesTopic_ = declare_parameter<std::string>(
+          "topics.joint_states", "/joint_states");
+      readJointStates_ =
+          declare_parameter<bool>("topics.read_joint_states", true);
+    } else {
+      anymalStateTopic_ =
+          declare_parameter<std::string>("topics.anymal_state", "/state");
+    }
     odomTopicPrefix_ =
         declare_parameter<std::string>("topics.odom_prefix", "/legged_estimator");
 
@@ -568,29 +476,37 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
                                        offsets[3 * foot + 2]));
     }
 
-    const std::vector<int64_t> fkIndices =
-        declare_parameter<std::vector<int64_t>>(
-            "calibration.spot_fk_position_indices",
-            {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
-    if (fkIndices.size() != 12) {
-      throw std::runtime_error(
-          "calibration.spot_fk_position_indices must contain 12 values");
-    }
-    spotFkPositionIndices_.clear();
-    for (const int64_t index : fkIndices) {
-      if (index < 0) {
+    if (robotType_ == "spot") {
+      spotOptions.footNames = footNames_;
+      spotOptions.legImuOffsets = legImuOffsets_;
+      spotOptions.footType = spotFootType_;
+      const std::vector<int64_t> fkIndices =
+          declare_parameter<std::vector<int64_t>>(
+              "calibration.spot_fk_position_indices",
+              {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
+      if (fkIndices.size() != 12) {
         throw std::runtime_error(
-            "calibration.spot_fk_position_indices cannot contain negatives");
+            "calibration.spot_fk_position_indices must contain 12 values");
       }
-      spotFkPositionIndices_.push_back(static_cast<size_t>(index));
-    }
+      spotOptions.fkPositionIndices.clear();
+      for (const int64_t index : fkIndices) {
+        if (index < 0) {
+          throw std::runtime_error(
+              "calibration.spot_fk_position_indices cannot contain negatives");
+        }
+        spotOptions.fkPositionIndices.push_back(static_cast<size_t>(index));
+      }
 
-    useJointFkForBodyPoint_ =
-        declare_parameter<bool>("calibration.use_joint_fk_for_body_point", true);
-    jointFkFallbackToMsgBodyPoint_ = declare_parameter<bool>(
-        "calibration.joint_fk_fallback_to_msg_body_point", true);
-    jointFkMaxJointAgeSeconds_ = declare_parameter<double>(
-        "calibration.joint_fk_max_joint_age_seconds", 0.05);
+      spotOptions.useJointFkForBodyPoint = declare_parameter<bool>(
+          "calibration.use_joint_fk_for_body_point", true);
+      spotOptions.jointFkFallbackToMsgBodyPoint = declare_parameter<bool>(
+          "calibration.joint_fk_fallback_to_msg_body_point", true);
+      spotOptions.jointFkMaxJointAgeSeconds = declare_parameter<double>(
+          "calibration.joint_fk_max_joint_age_seconds", 0.05);
+    } else {
+      anymalOptions.footNames = footNames_;
+      anymalOptions.legImuOffsets = legImuOffsets_;
+    }
 
     const std::vector<double> bodyPImuXyz =
         checkedDoubleVector(declare_parameter<std::vector<double>>(
@@ -607,13 +523,22 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
                          bodyQImuXyzw[1], bodyQImuXyzw[2]),
         Point3(bodyPImuXyz[0], bodyPImuXyz[1], bodyPImuXyz[2]));
 
-    contactStreamMode_ =
-        declare_parameter<std::string>("conversion.contact_stream_mode",
-                                       "transition");
-    contactStateValue_ =
-        declare_parameter<int>("conversion.contact_state_value", 1);
-    contactMadeCode_ = declare_parameter<int>("conversion.contact_made_code", 1);
-    contactLostCode_ = declare_parameter<int>("conversion.contact_lost_code", 2);
+    if (robotType_ == "spot") {
+      spotOptions.contactStreamMode =
+          declare_parameter<std::string>("conversion.contact_stream_mode",
+                                         "transition");
+      spotOptions.contactStateValue =
+          declare_parameter<int>("conversion.contact_state_value", 1);
+      spotOptions.contactMadeCode =
+          declare_parameter<int>("conversion.contact_made_code", 1);
+      spotOptions.contactLostCode =
+          declare_parameter<int>("conversion.contact_lost_code", 2);
+    } else {
+      anymalOptions.slippingIsContact = declare_parameter<bool>(
+          "conversion.anymal_slipping_is_contact", true);
+      anymalOptions.requireStateOk = declare_parameter<bool>(
+          "conversion.anymal_require_state_ok", false);
+    }
 
     filterNames_ = declare_parameter<std::vector<std::string>>(
         "estimator.variants", {"invariant_ekf"});
@@ -705,8 +630,13 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
     metadata_.footNames = footNames_;
     metadata_.denseContactStream = true;
     metadata_.timestampSource = "ros2_live";
-    inContact_.assign(footNames_.size(), false);
-    previousContactSet_.assign(footNames_.size(), false);
+    if (robotType_ == "spot") {
+      spotContactAdapter_ =
+          std::make_unique<SpotContactAdapter>(std::move(spotOptions));
+    } else {
+      anymalContactAdapter_ =
+          std::make_unique<AnymalContactAdapter>(std::move(anymalOptions));
+    }
   }
 
   rclcpp::QoS makeQos() const {
@@ -719,36 +649,31 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
     return qos;
   }
 
-  void setupFootTypeSupport() {
-    cppTypeSupportLibrary_ =
-        rclcpp::get_typesupport_library(footType_, "rosidl_typesupport_cpp");
-    cppTypeSupport_ = rclcpp::get_message_typesupport_handle(
-        footType_, "rosidl_typesupport_cpp", *cppTypeSupportLibrary_);
-    introspectionTypeSupportLibrary_ = rclcpp::get_typesupport_library(
-        footType_, "rosidl_typesupport_introspection_cpp");
-    introspectionTypeSupport_ = rclcpp::get_message_typesupport_handle(
-        footType_, "rosidl_typesupport_introspection_cpp",
-        *introspectionTypeSupportLibrary_);
-    footMembers_ = static_cast<const introspection::MessageMembers*>(
-        introspectionTypeSupport_->data);
-    serialization_ = std::make_unique<rclcpp::SerializationBase>(cppTypeSupport_);
-  }
-
   void setupRosInterfaces() {
     const rclcpp::QoS qos = makeQos();
     imuSub_ = create_subscription<Imu>(
         imuTopic_, qos,
         [this](const Imu::SharedPtr msg) { handleImu(*msg); });
-    if (readJointStates_) {
+    if (spotContactAdapter_ && readJointStates_) {
       jointStateSub_ = create_subscription<JointState>(
           jointStatesTopic_, qos,
           [this](const JointState::SharedPtr msg) { handleJointState(*msg); });
     }
-    footSub_ = create_generic_subscription(
-        footTopic_, footType_, qos,
-        [this](std::shared_ptr<rclcpp::SerializedMessage> msg) {
-          handleFootSerialized(msg);
-        });
+    if (spotContactAdapter_) {
+      footSub_ = create_generic_subscription(
+          spotFootTopic_, spotContactAdapter_->footType(), qos,
+          [this](std::shared_ptr<rclcpp::SerializedMessage> msg) {
+            handleFootSerialized(msg);
+          });
+    }
+    if (anymalContactAdapter_) {
+      anymalStateSub_ =
+          create_subscription<anymal_msgs::msg::AnymalState>(
+              anymalStateTopic_, qos,
+              [this](const anymal_msgs::msg::AnymalState::SharedPtr msg) {
+                handleAnymalState(*msg);
+              });
+    }
 
     const rclcpp::QoS pathQos =
         rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
@@ -791,6 +716,21 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
     RCLCPP_INFO(get_logger(), "%s%sOutput mode%s: %s (%s example: %s)",
                 kAnsiBold, kAnsiBlue, kAnsiReset, "fixed RViz topics",
                 "stable", exampleTopic.c_str());
+    RCLCPP_INFO(get_logger(), "%s%sRobot type%s: %s", kAnsiBold, kAnsiBlue,
+                kAnsiReset, robotType_.c_str());
+    if (spotContactAdapter_) {
+      RCLCPP_INFO(get_logger(),
+                  "%s%sSpot contact input%s: foot=%s (%s), joint_states=%s",
+                  kAnsiBold, kAnsiBlue, kAnsiReset, spotFootTopic_.c_str(),
+                  spotContactAdapter_->footType().c_str(),
+                  readJointStates_ ? jointStatesTopic_.c_str() : "disabled");
+    }
+    if (anymalContactAdapter_) {
+      RCLCPP_INFO(get_logger(),
+                  "%s%sANYmal contact input%s: anymal_state=%s",
+                  kAnsiBold, kAnsiBlue, kAnsiReset,
+                  anymalStateTopic_.c_str());
+    }
   }
 
   void handleImu(const Imu& msg) {
@@ -807,20 +747,23 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
   }
 
   void handleJointState(const JointState& msg) {
-    latestJointPositions_.assign(msg.position.begin(), msg.position.end());
-    lastJointTimestampS_ = rclcpp::Time(msg.header.stamp).seconds();
-    haveJointState_ = true;
+    if (spotContactAdapter_) {
+      spotContactAdapter_->updateJointState(msg);
+    }
   }
 
   void handleFootSerialized(
       const std::shared_ptr<rclcpp::SerializedMessage>& serialized) {
+    if (!spotContactAdapter_) {
+      return;
+    }
     try {
-      DynamicRosMessage message(footMembers_);
-      serialization_->deserialize_message(serialized.get(), message.data());
-      std::optional<ContactEvent> contactEvent = parseFootMessage(message.data());
+      std::optional<ContactEvent> contactEvent =
+          spotContactAdapter_->makeContactEvent(*serialized, nextContactIndex_);
       if (!contactEvent) {
         return;
       }
+      ++nextContactIndex_;
       LiveEvent event;
       event.type = LiveEvent::Type::kContact;
       event.timestampS = contactEvent->timestampS;
@@ -829,140 +772,36 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
     } catch (const std::exception& error) {
       if (!reportedFootParseError_) {
         reportedFootParseError_ = true;
-        RCLCPP_ERROR(get_logger(), "Failed to parse %s: %s", footType_.c_str(),
+        RCLCPP_ERROR(get_logger(), "Failed to parse %s: %s",
+                     spotContactAdapter_->footType().c_str(), error.what());
+      }
+    }
+  }
+
+  void handleAnymalState(const anymal_msgs::msg::AnymalState& msg) {
+    if (!anymalContactAdapter_) {
+      return;
+    }
+    try {
+      std::optional<ContactEvent> contactEvent =
+          anymalContactAdapter_->makeContactEvent(msg, nextContactIndex_);
+      if (!contactEvent) {
+        return;
+      }
+      ++nextContactIndex_;
+
+      LiveEvent event;
+      event.type = LiveEvent::Type::kContact;
+      event.timestampS = contactEvent->timestampS;
+      event.contact = std::move(*contactEvent);
+      enqueueEvent(std::move(event));
+    } catch (const std::exception& error) {
+      if (!reportedAnymalParseError_) {
+        reportedAnymalParseError_ = true;
+        RCLCPP_ERROR(get_logger(), "Failed to parse ANYmal state contacts: %s",
                      error.what());
       }
     }
-  }
-
-  std::optional<ContactEvent> parseFootMessage(const void* message) {
-    const double timestampS = stampToSec(message, footMembers_);
-    const introspection::MessageMember* statesMember =
-        findMember(footMembers_, "states");
-    if (statesMember == nullptr || !statesMember->is_array_ ||
-        statesMember->size_function == nullptr ||
-        statesMember->get_const_function == nullptr) {
-      throw std::runtime_error("FootStateArray.states is not a sequence");
-    }
-
-    const void* statesField = fieldPtr(message, statesMember);
-    const size_t usable =
-        std::min(statesMember->size_function(statesField), footNames_.size());
-    const introspection::MessageMembers* stateMembers =
-        nestedMembers(statesMember);
-
-    std::vector<bool> currentContactSet(footNames_.size(), false);
-    std::vector<ContactMeasurement> activeContacts;
-
-    for (size_t foot = 0; foot < usable; ++foot) {
-      const void* state = statesMember->get_const_function(statesField, foot);
-      const int contactCode =
-          static_cast<int>(readNumericField(state, stateMembers, "contact"));
-      if (contactStreamMode_ == "state") {
-        inContact_[foot] = contactCode == contactStateValue_;
-      } else {
-        if (contactCode == contactMadeCode_) {
-          inContact_[foot] = true;
-        } else if (contactCode == contactLostCode_) {
-          inContact_[foot] = false;
-        }
-      }
-      if (!inContact_[foot]) {
-        continue;
-      }
-
-      currentContactSet[foot] = true;
-      Vector3 bodyPoint = readFootBodyPoint(state, stateMembers);
-      if (useJointFkForBodyPoint_) {
-        const std::optional<Vector3> fk =
-            computeSpotBodyPointFromJointState(foot, timestampS);
-        if (fk) {
-          bodyPoint = *fk;
-        } else if (!jointFkFallbackToMsgBodyPoint_) {
-          continue;
-        }
-      }
-      bodyPoint += legImuOffsets_.at(foot);
-
-      ContactMeasurement measurement;
-      measurement.foot = foot;
-      measurement.bodyPoint = bodyPoint;
-      activeContacts.push_back(measurement);
-    }
-
-    if (activeContacts.empty()) {
-      return std::nullopt;
-    }
-
-    const bool contactSetChanged =
-        !havePreviousContactSet_ || currentContactSet != previousContactSet_;
-    for (ContactMeasurement& measurement : activeContacts) {
-      measurement.touchdown = contactSetChanged;
-    }
-    previousContactSet_ = std::move(currentContactSet);
-    havePreviousContactSet_ = true;
-
-    ContactEvent event;
-    event.index = nextContactIndex_++;
-    event.timestampS = timestampS;
-    event.activeContacts = std::move(activeContacts);
-    return event;
-  }
-
-  Vector3 readFootBodyPoint(const void* state,
-                            const introspection::MessageMembers* stateMembers) {
-    const introspection::MessageMember* pointMember =
-        findMember(stateMembers, "foot_position_rt_body");
-    if (pointMember == nullptr) {
-      throw std::runtime_error(
-          "FootState is missing foot_position_rt_body field");
-    }
-    const void* point = fieldPtr(state, pointMember);
-    const introspection::MessageMembers* pointMembers =
-        nestedMembers(pointMember);
-    return Vector3(readNumericField(point, pointMembers, "x"),
-                   readNumericField(point, pointMembers, "y"),
-                   readNumericField(point, pointMembers, "z"));
-  }
-
-  std::optional<Vector3> computeSpotBodyPointFromJointState(
-      size_t foot, double measurementTimestampS) const {
-    static const std::array<std::array<Vector3, 4>, 4> kSpotLegChains{{
-        {Vector3(0.0, 0.055, 0.0), Vector3(0.0, 0.110945, 0.0),
-         Vector3(0.025, 0.0, -0.3205), Vector3(0.0, 0.0, -0.34)},
-        {Vector3(0.0, -0.055, 0.0), Vector3(0.0, -0.110945, 0.0),
-         Vector3(0.025, 0.0, -0.3205), Vector3(0.0, 0.0, -0.34)},
-        {Vector3(-0.5957, 0.055, 0.0), Vector3(0.0, 0.110945, 0.0),
-         Vector3(0.025, 0.0, -0.3205), Vector3(0.0, 0.0, -0.34)},
-        {Vector3(-0.5957, -0.055, 0.0), Vector3(0.0, -0.110945, 0.0),
-         Vector3(0.025, 0.0, -0.3205), Vector3(0.0, 0.0, -0.34)}}};
-
-    if (foot >= kSpotLegChains.size() || !haveJointState_) {
-      return std::nullopt;
-    }
-    if (jointFkMaxJointAgeSeconds_ > 0.0 &&
-        std::abs(measurementTimestampS - lastJointTimestampS_) >
-            jointFkMaxJointAgeSeconds_) {
-      return std::nullopt;
-    }
-
-    const size_t i0 = spotFkPositionIndices_.at(3 * foot + 0);
-    const size_t i1 = spotFkPositionIndices_.at(3 * foot + 1);
-    const size_t i2 = spotFkPositionIndices_.at(3 * foot + 2);
-    if (i0 >= latestJointPositions_.size() ||
-        i1 >= latestJointPositions_.size() ||
-        i2 >= latestJointPositions_.size()) {
-      return std::nullopt;
-    }
-
-    const Rot3 a12 = Rot3::Rx(latestJointPositions_[i0]);
-    const Rot3 a23 = Rot3::Ry(latestJointPositions_[i1]);
-    const Rot3 a34 = Rot3::Ry(latestJointPositions_[i2]);
-    const Rot3 a123 = a12 * a23;
-    const Rot3 a1234 = a123 * a34;
-    const auto& chain = kSpotLegChains[foot];
-    return a1234.matrix() * chain[3] + a123.matrix() * chain[2] +
-           a12.matrix() * chain[1] + chain[0];
   }
 
   void enqueueEvent(LiveEvent event) {
@@ -1355,8 +1194,10 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
   }
 
   std::string imuTopic_;
-  std::string footTopic_;
-  std::string footType_;
+  std::string robotType_ = "spot";
+  std::string spotFootTopic_;
+  std::string spotFootType_;
+  std::string anymalStateTopic_;
   std::string jointStatesTopic_;
   std::string odomTopicPrefix_;
   std::string frameId_;
@@ -1374,14 +1215,6 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
 
   std::vector<std::string> footNames_;
   std::vector<Vector3> legImuOffsets_;
-  std::vector<size_t> spotFkPositionIndices_;
-  bool useJointFkForBodyPoint_ = true;
-  bool jointFkFallbackToMsgBodyPoint_ = true;
-  double jointFkMaxJointAgeSeconds_ = 0.05;
-  std::string contactStreamMode_ = "transition";
-  int contactStateValue_ = 1;
-  int contactMadeCode_ = 1;
-  int contactLostCode_ = 2;
 
   std::vector<std::string> filterNames_;
   fs::path outputDir_;
@@ -1396,15 +1229,9 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
   bool qosReliable_ = false;
   double reorderDelaySeconds_ = 0.02;
 
-  std::shared_ptr<rcpputils::SharedLibrary> cppTypeSupportLibrary_;
-  std::shared_ptr<rcpputils::SharedLibrary> introspectionTypeSupportLibrary_;
-  const rosidl_message_type_support_t* cppTypeSupport_ = nullptr;
-  const rosidl_message_type_support_t* introspectionTypeSupport_ = nullptr;
-  const introspection::MessageMembers* footMembers_ = nullptr;
-  std::unique_ptr<rclcpp::SerializationBase> serialization_;
-
   rclcpp::Subscription<Imu>::SharedPtr imuSub_;
   rclcpp::Subscription<JointState>::SharedPtr jointStateSub_;
+  rclcpp::Subscription<anymal_msgs::msg::AnymalState>::SharedPtr anymalStateSub_;
   rclcpp::GenericSubscription::SharedPtr footSub_;
   std::vector<rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr>
       odomPublishers_;
@@ -1418,13 +1245,10 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
   std::vector<size_t> pathStateCounters_;
   rclcpp::TimerBase::SharedPtr flushTimer_;
 
-  std::vector<double> latestJointPositions_;
-  bool haveJointState_ = false;
-  double lastJointTimestampS_ = 0.0;
-  std::vector<bool> inContact_;
-  std::vector<bool> previousContactSet_;
-  bool havePreviousContactSet_ = false;
   bool reportedFootParseError_ = false;
+  bool reportedAnymalParseError_ = false;
+  std::unique_ptr<SpotContactAdapter> spotContactAdapter_;
+  std::unique_ptr<AnymalContactAdapter> anymalContactAdapter_;
 
   std::mutex queueMutex_;
   std::priority_queue<QueuedEvent, std::vector<QueuedEvent>,

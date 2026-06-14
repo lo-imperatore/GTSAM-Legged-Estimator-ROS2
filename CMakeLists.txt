@@ -12,6 +12,7 @@ if(EXISTS "/usr/bin/python3")
       "Python executable used by ament_cmake" FORCE)
 endif()
 find_package(ament_cmake REQUIRED)
+find_package(anymal_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
@@ -23,7 +24,9 @@ find_package(rosidl_typesupport_introspection_cpp REQUIRED)
 add_subdirectory(spot_msgs)
 
 add_executable(LeggedEstimatorRos2Node
+  src/AnymalContactAdapter.cpp
   src/LeggedEstimatorRos2Node.cpp
+  src/SpotContactAdapter.cpp
 )
 
 target_include_directories(LeggedEstimatorRos2Node
@@ -35,6 +38,7 @@ target_link_libraries(LeggedEstimatorRos2Node
   gtsam_unstable
 )
 ament_target_dependencies(LeggedEstimatorRos2Node
+  anymal_msgs
   builtin_interfaces
   geometry_msgs
   rclcpp
