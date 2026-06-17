@@ -26,8 +26,8 @@ GTSAM_legged_estimator:
 
       # body_P_imu is the IMU pose expressed in the robot body frame.
       # Quaternion uses ROS order [x, y, z, w].
-      body_p_imu_xyz: [0.0, 0.0, 0.0]
-      body_q_imu_xyzw: [0.0, 0.0, 0.0, 1.0]
+      body_p_imu_xyz: [-0.25565, 0.00255, 0.07672]
+      body_q_imu_xyzw: [0.0, 1.0, 0.0, 0.0]
 
     conversion:
       anymal_slipping_is_contact: true

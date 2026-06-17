@@ -518,10 +518,11 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
                                   "calibration.body_q_imu_xyzw",
                                   {0.0, 0.0, 0.0, 1.0}),
                               "calibration.body_q_imu_xyzw");
-    replayConfig_.body_P_imu = Pose3(
+    bodyPImu_ = Pose3(
         Rot3::Quaternion(bodyQImuXyzw[3], bodyQImuXyzw[0],
                          bodyQImuXyzw[1], bodyQImuXyzw[2]),
         Point3(bodyPImuXyz[0], bodyPImuXyz[1], bodyPImuXyz[2]));
+    replayConfig_.body_P_imu = Pose3();
 
     if (robotType_ == "spot") {
       spotOptions.contactStreamMode =
@@ -738,11 +739,14 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
     event.type = LiveEvent::Type::kImu;
     event.timestampS = rclcpp::Time(msg.header.stamp).seconds();
     event.imu.timestampS = event.timestampS;
-    event.imu.omega = Vector3(msg.angular_velocity.x, msg.angular_velocity.y,
-                              msg.angular_velocity.z);
-    event.imu.specificForce =
-        Vector3(msg.linear_acceleration.x, msg.linear_acceleration.y,
-                msg.linear_acceleration.z);
+    const Rot3 bodyRImu = bodyPImu_.rotation();
+    const Vector3 omegaImu(msg.angular_velocity.x, msg.angular_velocity.y,
+                           msg.angular_velocity.z);
+    const Vector3 specificForceImu(msg.linear_acceleration.x,
+                                   msg.linear_acceleration.y,
+                                   msg.linear_acceleration.z);
+    event.imu.omega = bodyRImu.rotate(omegaImu);
+    event.imu.specificForce = bodyRImu.rotate(specificForceImu);
     enqueueEvent(std::move(event));
   }
 
@@ -1013,16 +1017,18 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
     return stamp;
   }
 
-  geometry_msgs::msg::PoseStamped makePoseStamped(
+  geometry_msgs::msg::PoseStamped makeBasePoseStamped(
       const builtin_interfaces::msg::Time& stamp,
       const NavState& state) const {
     geometry_msgs::msg::PoseStamped pose;
     pose.header.stamp = stamp;
     pose.header.frame_id = frameId_;
-    pose.pose.position.x = state.position().x();
-    pose.pose.position.y = state.position().y();
-    pose.pose.position.z = state.position().z();
-    const auto quaternion = state.quaternion();
+    const Pose3 worldPBase = state.pose();
+    const Point3 position = worldPBase.translation();
+    pose.pose.position.x = position.x();
+    pose.pose.position.y = position.y();
+    pose.pose.position.z = position.z();
+    const auto quaternion = worldPBase.rotation().toQuaternion();
     pose.pose.orientation.x = quaternion.x();
     pose.pose.orientation.y = quaternion.y();
     pose.pose.orientation.z = quaternion.z();
@@ -1142,7 +1148,8 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
     }
 
     const builtin_interfaces::msg::Time stamp = stampFromSeconds(timestampS);
-    const geometry_msgs::msg::PoseStamped pose = makePoseStamped(stamp, state);
+    const geometry_msgs::msg::PoseStamped pose =
+        makeBasePoseStamped(stamp, state);
     if (publishOdom_) {
       publishOdometry(index, pose, state);
     }
@@ -1219,6 +1226,7 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
   std::vector<std::string> filterNames_;
   fs::path outputDir_;
   ReplayConfig replayConfig_;
+  Pose3 bodyPImu_;
   DatasetMetadata metadata_;
   double maxDurationSeconds_ = std::numeric_limits<double>::infinity();
   bool disableFullContactInitialization_ = false;
