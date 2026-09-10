@@ -53,6 +53,33 @@ Alternatively, point CMake directly at the GTSAM package config directory:
 export GTSAM_DIR=/path/to/gtsam/install/lib/cmake/GTSAM
 ```
 
+## Docker
+
+The included `Dockerfile` / `docker-compose.yaml` build a ROS 2 image with
+GTSAM compiled from source (`develop` branch, `GTSAM_BUILD_UNSTABLE=ON`), so
+no host-side GTSAM install is needed:
+
+```bash
+docker compose build
+docker compose run --rm gtsam_legged_estimator
+```
+
+Inside the container, this package is mounted read/write at
+`/ros2_ws/src/GTSAM-Legged-Estimator-ROS2`:
+
+```bash
+cd /ros2_ws
+colcon build
+source install/setup.bash
+```
+
+Override the ROS distribution or pin a specific GTSAM commit via env vars
+before building:
+
+```bash
+ROS_DISTRO=humble GTSAM_GIT_REF=<commit-sha> docker compose build
+```
+
 ## Dataset
 
 The experiments use the dataset from
@@ -88,12 +115,13 @@ Select the robot-specific config from launch with `robot_type`:
 ```bash
 ros2 launch gtsam_legged_replay_example GTSAM_legged_estimator.launch.xml robot_type:=spot
 ros2 launch gtsam_legged_replay_example GTSAM_legged_estimator.launch.xml robot_type:=anymal
+ros2 launch gtsam_legged_replay_example GTSAM_legged_estimator.launch.xml robot_type:=g1
 ```
 
 ## Input Topics
 
-Robot-specific defaults are defined in `config/spot_legged_estimator.yaml` and
-`config/anymal_legged_estimator.yaml`.
+Robot-specific defaults are defined in `config/spot_legged_estimator.yaml`,
+`config/anymal_legged_estimator.yaml`, and `config/g1_legged_estimator.yaml`.
 
 ```text
 Spot:
@@ -101,9 +129,39 @@ Spot:
   /spot/status/feet  spot_msgs/msg/FootStateArray
   /joint_states      sensor_msgs/msg/JointState
 
+Spot supports the same two contact methods. `state` uses
+`/spot/status/feet`; `joint_torque_grf` reads the named `front_left_*`,
+`front_right_*`, `rear_left_*`, and `rear_right_*` joints from
+`/joint_states`, reconstructs each foot GRF, and applies the stateful contact
+classifier. The Spot config defaults to `joint_torque_grf`.
+
 ANYmal:
   /anymal/imu                             sensor_msgs/msg/Imu
   /anymal/state_estimator/anymal_state   anymal_msgs/msg/AnymalState
+
+The ANYmal adapter supports exactly two contact methods. `state` uses the
+robot-provided `contacts[].state`. `joint_torque_grf` computes the foot position
+and Jacobian from the HAA/HFE/KFE joint positions, reconstructs GRF from
+`tau = J^T * force` with a damped solve, and applies the stateful vertical-GRF
+contact classifier. Select either method at launch with:
+
+```bash
+ros2 launch gtsam_legged_replay_example GTSAM_legged_estimator.launch.xml \
+  robot_type:=anymal anymal_contact_classifier:=state
+```
+
+Unitree G1:
+
+  /lowstate                              unitree_hg/msg/LowState
+
+The G1 adapter reads the IMU and the first 12 lower-body motor states from the
+same `LowState` packet. Since `unitree_hg/msg/LowState` does not expose foot
+force or contact flags, it infers contact from the G1 leg Jacobian and
+`tau_est` via `tau = J^T * wrench`. The vertical wrench is filtered
+and classified with separate contact-on/contact-off thresholds. The thresholds,
+damping, optional FK height guard, and motor indices are configurable in
+`config/g1_legged_estimator.yaml`. A dedicated pressure/contact message should
+replace this model-based estimate when one is available on the robot.
 ```
 
 When `topics.read_joint_states: true`, the node uses `/joint_states` to compute
@@ -120,7 +178,21 @@ so the same RViz configuration works even when the selected variant changes.
 /legged_estimator/odom           nav_msgs/msg/Odometry
 /legged_estimator/path           nav_msgs/msg/Path
 /legged_estimator/foot_contacts  visualization_msgs/msg/MarkerArray
+/legged_estimator/g1_contact_debug  std_msgs/msg/Float64MultiArray (G1 only)
 ```
+
+The G1 contact debug array contains, in order:
+
+```text
+[left_raw_N, right_raw_N,
+ left_filtered_N, right_filtered_N,
+ left_threshold_N, right_threshold_N,
+ left_contact, right_contact]
+```
+
+The contact entries are `1.0` when active and `0.0` when inactive. The active
+threshold switches between `g1_contact_force_on` and
+`g1_contact_force_off` to show the detector hysteresis.
 
 If `estimator.variants` contains zero or multiple variants, the node exits at
 startup with an error.

@@ -1,17 +1,26 @@
 <launch>
   <arg name="robot_type" default="spot"/>
+  <arg name="node_name" default="GTSAM_legged_estimator"/>
   <arg name="params_file" default="$(find-pkg-share gtsam_legged_replay_example)/config/$(var robot_type)_legged_estimator.yaml"/>
   <arg name="output_dir" default="./outputs/live"/>
-  <arg name="use_rviz" default="true"/>
+  <arg name="odom_prefix" default="/legged_estimator"/>
+  <arg name="anymal_contact_classifier" default="joint_torque_grf"/>
+  <arg name="spot_contact_classifier" default="joint_torque_grf"/>
+  <arg name="use_rviz" default="false"/>
   <arg name="rviz_config" default="$(find-pkg-share gtsam_legged_replay_example)/config/GTSAM_legged_estimator.rviz"/>
 
   <node pkg="gtsam_legged_replay_example"
         exec="LeggedEstimatorRos2Node"
-        name="GTSAM_legged_estimator"
+        name="$(var node_name)"
         output="screen">
     <param from="$(var params_file)"/>
     <param name="robot.type" value="$(var robot_type)"/>
     <param name="estimator.output_dir" value="$(var output_dir)"/>
+    <param name="topics.odom_prefix" value="$(var odom_prefix)"/>
+    <param name="conversion.anymal_contact_classifier"
+           value="$(var anymal_contact_classifier)"/>
+    <param name="conversion.spot_contact_classifier"
+           value="$(var spot_contact_classifier)"/>
   </node>
 
   <node pkg="rviz2"

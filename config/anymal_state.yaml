@@ -1,18 +1,13 @@
 GTSAM_legged_estimator:
   ros__parameters:
     robot:
-      type: spot
+      type: anymal
 
     topics:
-      imu: /imu
-      foot: /spot/status/feet
-      foot_type: spot_msgs/msg/FootStateArray
+      imu: /anymal/imu
       anymal_state: /anymal/state_estimator/anymal_state
-      use_anymal_contacts: false
-      joint_states: /joint_states
-      read_joint_states: true
       # Outputs use fixed RViz topics: /legged_estimator/{odom,path,foot_contacts}.
-      odom_prefix: /legged_estimator
+      odom_prefix: /legged_estimator_state
 
     frames:
       odom: odom
@@ -31,40 +26,38 @@ GTSAM_legged_estimator:
 
       # body_P_imu is the IMU pose expressed in the robot body frame.
       # Quaternion uses ROS order [x, y, z, w].
-      body_p_imu_xyz: [0.0, 0.0, 0.0]
-      body_q_imu_xyzw: [0.0, 0.0, 0.0, 1.0]
-
-      use_joint_fk_for_body_point: true
-      joint_fk_fallback_to_msg_body_point: true
-      joint_fk_max_joint_age_seconds: 0.05
-      spot_fk_position_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+      body_p_imu_xyz: [-0.25565, 0.00255, 0.07672]
+      body_q_imu_xyzw: [0.0, 1.0, 0.0, 0.0]
 
     conversion:
-      # FootState.msg defines CONTACT_MADE=1 and CONTACT_LOST=2.
-      contact_stream_mode: transition
-      contact_state_value: 1
-      contact_made_code: 1
-      contact_lost_code: 2
       anymal_slipping_is_contact: true
       anymal_require_state_ok: false
+      # Use the contact state supplied directly by AnymalState.contacts[].state.
+      anymal_contact_classifier: state
 
     estimator:
       variants: [invariant_ekf]  # exactly one of: invariant_ekf, invariant_graph, fixed_lag_single_bias, fixed_lag_combined_bias
-      output_dir: ./outputs/live
+      output_dir: ./outputs/anymal_state
+      initial_position_xyz: [0.0, 0.0, 0.4]
+      initial_orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
       max_duration_seconds: 0.0
       lag_seconds: 1.0
       max_dead_reckoning_seconds: 0.100
       sigma_acc: 0.020
-      bias_acc_random_walk_sigma: 0.005
+      bias_acc_random_walk_sigma: 0.0005
       bias_omega_random_walk_sigma: 0.0001
-      contact_sigma_xy: 0.030
-      contact_sigma_z: 0.020
+      contact_sigma_xy: 0.005
+      contact_sigma_z: 0.001
       use_robust_contact_noise: false
       robust_contact_huber_k: 2.0
       marginalize_leaving_foot: true
-      disable_full_contact_initialization: false
+      disable_full_contact_initialization: true
       startup_bias_window_seconds: 1.0
-      startup_timeout_seconds: 5.0
+      startup_timeout_seconds: 1.0
+      # Set false to use these values instead of the online startup estimate.
+      bias_recalc_at_start: true
+      manual_imu_bias_acc: [0.0, 0.0, 0.0]
+      manual_imu_bias_gyro: [0.0, 0.0, 0.0]
 
     qos:
       reliability: best_effort

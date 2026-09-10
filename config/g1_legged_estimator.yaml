@@ -1,0 +1,84 @@
+GTSAM_legged_estimator:
+  ros__parameters:
+    robot:
+      type: g1
+
+    topics:
+      # Unitree G1 LowState contains both the IMU and lower-body motor states.
+      # The node uses ROS receive time because LowState has no ROS Header.
+      low_state: /lowstate
+      odom_prefix: /legged_estimator
+
+    frames:
+      odom: odom
+      base_link: pelvis
+
+    calibration:
+      foot_names: [left, right]
+      leg_imu_offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+      # left hip pitch/roll/yaw, knee, ankle pitch/roll, then right leg.
+      # This ordering is shared by the G1 23-DoF and 29-DoF LowState layouts.
+      g1_leg_motor_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+
+      # Pose of the LowState IMU in the pelvis frame, ROS quaternion order.
+      # Update these values if your G1 revision uses a different mounting.
+      body_p_imu_xyz: [0.04525, 0.0, -0.08339]
+      body_q_imu_xyzw: [0.0, 0.0, 0.0, 1.0]
+
+    conversion:
+      # LowState has no foot-force/contact field. Contact is inferred from
+      # tau_est using tau=J^T*wrench. Separate thresholds provide hysteresis.
+      # Tune these values from recorded standing/walking LowState data.
+      g1_contact_force_on: 225.0      # N
+      g1_contact_force_off: 80.0      # N
+      g1_contact_force_filter_alpha: 0.2
+      g1_wrench_damping: 0.01
+      g1_max_valid_contact_force: 2000.0
+
+      # Optional secondary rejection of a foot well above the other foot.
+      g1_use_height_guard: true
+      g1_contact_height_tolerance: 0.025
+      g1_contact_release_height: 0.045
+
+    estimator:
+      variants: [fixed_lag_single_bias] # exactly one of: invariant_ekf, invariant_graph, fixed_lag_single_bias, fixed_lag_combined_bias
+      output_dir: ./outputs/g1_live
+      initial_position_xyz: [0.0, 0.0, 0.54]
+      initial_orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+      max_duration_seconds: 0.0
+      lag_seconds: 1.0
+      max_dead_reckoning_seconds: 0.100
+      sigma_acc: 0.200
+      bias_acc_random_walk_sigma: 0.000001
+      bias_omega_random_walk_sigma: 0.000001
+      contact_sigma_xy: 0.02
+      contact_sigma_z: 0.008
+      use_robust_contact_noise: true
+      robust_contact_huber_k: 2.0
+      marginalize_leaving_foot: true
+      # For G1, initialization waits for both feet. The biped initializer keeps
+      # the startup attitude and uses the two contacts to initialize height and
+      # footholds.
+      disable_full_contact_initialization: false
+      startup_bias_window_seconds: 1.0
+      startup_timeout_seconds: 5.0
+      # Set false to use these values instead of the online startup estimate.
+      bias_recalc_at_start: true
+      manual_imu_bias_acc: [-0.010, -0.025, -0.073]
+      manual_imu_bias_gyro: [0.00400358, 0.00223544, -0.00070]
+
+    qos:
+      reliability: best_effort
+      depth: 1000
+      reorder_delay_seconds: 0.02
+
+    publish_odom: true
+    publish_path: false
+    publish_foot_contacts: false
+    foot_contact_touchdowns_only: false
+    foot_contact_marker_scale: 0.08
+    foot_contact_marker_z_offset: 0.02
+    foot_contact_max_points: 5000
+    path_publish_decimation: 10
+    path_max_poses: 10000

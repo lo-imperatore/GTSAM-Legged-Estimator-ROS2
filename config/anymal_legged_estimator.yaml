@@ -1,4 +1,4 @@
-GTSAM_legged_estimator:
+/**:
   ros__parameters:
     robot:
       type: anymal
@@ -32,33 +32,51 @@ GTSAM_legged_estimator:
     conversion:
       anymal_slipping_is_contact: true
       anymal_require_state_ok: false
-
+      # Reconstruct GRF from joint positions and efforts instead of using the
+      # robot-provided AnymalState.contacts[].state.
+      anymal_contact_classifier: joint_torque_grf
+      anymal_contact_force_on: 110.0
+      anymal_contact_force_off: 100.0
+      anymal_contact_max_force_delta: 40.0
+      anymal_contact_force_window_size: 4
+      anymal_contact_on_samples: 20
+      anymal_contact_use_force_window: false
+      anymal_contact_force_delta_off_samples: 3
+      anymal_contact_use_absolute_force_z: true
+      # URDF inertias are used for Pronto's default h(q, qdot) compensation.
+      anymal_urdf_path: /ros2_ws/src/anymal_d_simple_description/urdf/anymal.urdf
     estimator:
       variants: [invariant_ekf]  # exactly one of: invariant_ekf, invariant_graph, fixed_lag_single_bias, fixed_lag_combined_bias
       output_dir: ./outputs/live
+      initial_position_xyz: [0.0, 0.0, 0.4]
+      initial_orientation_xyzw: [0.017665, 0.009700, -0.017172, 0.999649]
       max_duration_seconds: 0.0
       lag_seconds: 1.0
       max_dead_reckoning_seconds: 0.100
       sigma_acc: 0.020
       bias_acc_random_walk_sigma: 0.005
       bias_omega_random_walk_sigma: 0.0001
-      contact_sigma_xy: 0.030
-      contact_sigma_z: 0.020
+      contact_sigma_xy: 0.03
+      contact_sigma_z: 0.02
       use_robust_contact_noise: false
       robust_contact_huber_k: 2.0
       marginalize_leaving_foot: true
       disable_full_contact_initialization: false
       startup_bias_window_seconds: 1.0
       startup_timeout_seconds: 5.0
+      # Set false to use these values instead of the online startup estimate.
+      bias_recalc_at_start: true
+      manual_imu_bias_acc: [-0.005773, -0.000423, 0.058955]
+      manual_imu_bias_gyro: [-0.000702, -0.000382, 0.000420]
 
     qos:
       reliability: best_effort
       depth: 1000
-      reorder_delay_seconds: 0.1
+      reorder_delay_seconds: 0.05
 
     publish_odom: true
-    publish_path: true
-    publish_foot_contacts: true
+    publish_path: false
+    publish_foot_contacts: false
     foot_contact_touchdowns_only: false
     foot_contact_marker_scale: 0.12
     foot_contact_marker_z_offset: 0.03

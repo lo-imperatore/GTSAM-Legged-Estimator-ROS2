@@ -16,10 +16,23 @@ namespace gtsam {
 
 class SpotContactAdapter {
  public:
+  struct FootDiagnostic {
+    std::string footName;
+    bool valid = false;
+    double grfZ = 0.0;
+    double classifierForce = 0.0;
+    bool classifiedContact = false;
+  };
+
+  struct Diagnostics {
+    std::vector<FootDiagnostic> feet;
+  };
+
   struct Options {
     std::vector<std::string> footNames;
     std::vector<Vector3> legImuOffsets;
     std::string footType = "spot_msgs/msg/FootStateArray";
+    std::string contactClassifier = "state";
     std::string contactStreamMode = "transition";
     int contactStateValue = 1;
     int contactMadeCode = 1;
@@ -29,6 +42,18 @@ class SpotContactAdapter {
     double jointFkMaxJointAgeSeconds = 0.05;
     std::vector<size_t> fkPositionIndices{
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+    double contactForceOn = 70.0;
+    double contactForceOff = 50.0;
+    double contactMaxForceDelta = 40.0;
+    size_t contactForceWindowSize = 4;
+    size_t contactOnSamples = 4;
+    bool contactUseForceWindow = false;
+    size_t contactForceDeltaOffSamples = 3;
+    bool contactUseAbsoluteForceZ = true;
+    double jointTorqueGrfDamping = 0.02;
+    double jointTorqueScale = 1.0;
+    std::string urdfPath;
+    double contactPointZOffset = -0.03305;
   };
 
   explicit SpotContactAdapter(Options options);
@@ -38,7 +63,11 @@ class SpotContactAdapter {
   SpotContactAdapter& operator=(const SpotContactAdapter&) = delete;
 
   const std::string& footType() const;
+  bool usesFootContactMessages() const;
   void updateJointState(const sensor_msgs::msg::JointState& msg);
+  std::optional<ContactEvent> makeJointTorqueGrfContactEvent(
+      const sensor_msgs::msg::JointState& msg, size_t eventIndex,
+      Diagnostics* diagnostics = nullptr);
   std::optional<ContactEvent> makeContactEvent(
       rclcpp::SerializedMessage& serialized, size_t eventIndex);
 

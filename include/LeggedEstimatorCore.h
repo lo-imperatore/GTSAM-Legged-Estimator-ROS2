@@ -31,24 +31,29 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <cstdio>
 
 #include "include/LeggedEstimatorReplayUtils.h"
 
 namespace gtsam {
 
 struct ReplayConfig : public LeggedEstimatorParams {
-  Vector3 gravity = Vector3(0.0, 0.0, -9.81);
-  // Contact body points are already expressed in IMU frame.
-  // Keep body->IMU extrinsic as identity to avoid double-transform.
+  Vector3 gravity = Vector3(0.0, 0.0, -9.80665);
+  // The navigation state and contact measurements are base-centred. This
+  // transform therefore remains identity inside the estimator; the ROS node
+  // owns the physical IMU extrinsic used to rotate sensor measurements.
   Pose3 body_P_imu = Pose3();
   Point3 initialPosition = Point3(0.0, 0.0, 0.0);
+  Rot3 initialAttitude = Rot3();
   Vector3 initialVelocity = Vector3::Zero();
   Vector initialBaseCovarianceDiagonal =
       (Vector(9) << 1e-2, 1e-2, 1e-6, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05)
           .finished();
-  double sigmaGyro = 8e-4;
+  double sigmaGyro = 8e-3;
   double sigmaIntegration = 1e-3;
   double sigmaAcc = 2e-2;
+  bool negateAccelStartupRollPitch = false;
+  bool useImuOrientationForStartupBias = false;
   double lagSeconds = 1.0;
   double maxDeadReckoningSeconds = 0.100;
 };
@@ -57,6 +62,8 @@ struct InitialBiasEstimate {
   imuBias::ConstantBias bias;
   std::string source;
   size_t sampleCount = 0;
+  std::vector<ImuSample> samples;
+  std::optional<NavState> initialNavState;
 };
 
 inline std::optional<ContactEvent> firstFullContactEvent(
@@ -71,39 +78,158 @@ inline std::optional<ContactEvent> firstFullContactEvent(
 
 inline NavState fullContactInitializationNavState(
     const ReplayConfig& replayConfig,
-    const std::vector<ContactMeasurement>& activeContacts) {
-  Matrix imuContacts(3, static_cast<Eigen::Index>(activeContacts.size()));
+    const std::vector<std::string>& footNames,
+    const std::vector<ContactMeasurement>& activeContacts,
+    const std::vector<Vector3>& planeContactPoints = {},
+    const std::string& planeContactSource = "body_imu_contacts",
+    const bool rotatePlaneAttitudeToImu = false) {
+  const bool useProvidedContactPlane =
+      planeContactPoints.size() == activeContacts.size();
+  Matrix planeContacts(3, static_cast<Eigen::Index>(activeContacts.size()));
   for (size_t index = 0; index < activeContacts.size(); ++index) {
-    imuContacts.col(static_cast<Eigen::Index>(index)) =
-        replayConfig.body_P_imu.transformTo(
-            Point3(activeContacts[index].bodyPoint));
+    planeContacts.col(static_cast<Eigen::Index>(index)) =
+        useProvidedContactPlane
+            ? planeContactPoints[index]
+            : replayConfig.body_P_imu.transformTo(
+                  Point3(activeContacts[index].bodyPoint));
   }
 
-  const Vector3 centroid = imuContacts.rowwise().mean();
-  const Matrix centered = imuContacts.colwise() - centroid;
+  const Vector3 centroid = planeContacts.rowwise().mean();
+  const Matrix centered = planeContacts.colwise() - centroid;
   Vector3 normal =
       Eigen::JacobiSVD<Matrix>(centered, Eigen::ComputeFullU).matrixU().col(2);
   if (normal.z() < 0.0) {
     normal = -normal;
   }
 
-  const double roll = std::atan2(normal.y(), normal.z());
-  const double pitch = std::asin(-normal.x());
-  const Rot3 attitude = Rot3::Ypr(0.0, pitch, roll);
+  const double planeRoll = std::atan2(normal.y(), normal.z());
+  const double planePitch = std::asin(-normal.x());
+  const Rot3 planeAttitude = Rot3::Ypr(0.0, planePitch, planeRoll);
+  const Rot3 attitude = rotatePlaneAttitudeToImu
+                            ? Rot3(planeAttitude.matrix() *
+                                   replayConfig.body_P_imu.rotation().matrix())
+                            : planeAttitude;
+  const Matrix3 attitudeMatrix = attitude.matrix();
+  const double roll = std::atan2(attitudeMatrix(2, 1), attitudeMatrix(2, 2));
+  const double pitch = std::asin(-attitudeMatrix(2, 0));
 
   double height = 0.0;
-  for (const ContactMeasurement& contact : activeContacts) {
-    const Point3 measurement =
-        replayConfig.body_P_imu.transformTo(Point3(contact.bodyPoint));
-    height -= attitude.matrix().row(2).dot(measurement);
+  for (Eigen::Index index = 0; index < planeContacts.cols(); ++index) {
+    height -= planeAttitude.matrix().row(2).dot(planeContacts.col(index));
   }
   height /= static_cast<double>(activeContacts.size());
+
+  std::fprintf(stderr,
+    "[INIT ATTITUDE from contacts]  source=%s  plane_roll=%.4f  "
+    "plane_pitch=%.4f  bias_roll=%.4f  bias_pitch=%.4f  height=%.4f  "
+    "floor_normal=[%.4f, %.4f, %.4f]\n",
+    useProvidedContactPlane ? planeContactSource.c_str() : "body_imu_contacts",
+    planeRoll, planePitch, roll, pitch, height, normal.x(), normal.y(),
+    normal.z());
+  for (size_t index = 0; index < activeContacts.size(); ++index) {
+    const ContactMeasurement& contact = activeContacts[index];
+    const Vector3 planePoint = planeContacts.col(static_cast<Eigen::Index>(index));
+    const Point3 measurement =
+        replayConfig.body_P_imu.transformTo(Point3(contact.bodyPoint));
+    const char* footName = contact.foot < footNames.size()
+                               ? footNames[contact.foot].c_str()
+                               : "unknown";
+    std::fprintf(stderr,
+                 "[INIT PLANE CONTACT POINT] order=%zu  foot=%-4s idx=%zu  "
+                 "plane_point=[%.6f, %.6f, %.6f]  "
+                 "imu_pos=[%.6f, %.6f, %.6f]  "
+                 "body_point=[%.6f, %.6f, %.6f]\n",
+                 index, footName, contact.foot, planePoint.x(),
+                 planePoint.y(), planePoint.z(), measurement.x(),
+                 measurement.y(), measurement.z(), contact.bodyPoint.x(),
+                 contact.bodyPoint.y(), contact.bodyPoint.z());
+  }
+
+
   return NavState(attitude, Point3(0.0, 0.0, height), Vector3::Zero());
 }
 
+inline std::optional<NavState> anymalPoseInitializationNavState(
+    const ContactEvent& event) {
+  if (!event.hasWorldFromBody) {
+    return std::nullopt;
+  }
+
+  const double squaredNorm =
+      event.worldFromBodyW * event.worldFromBodyW +
+      event.worldFromBodyX * event.worldFromBodyX +
+      event.worldFromBodyY * event.worldFromBodyY +
+      event.worldFromBodyZ * event.worldFromBodyZ;
+  if (squaredNorm <= 1.0e-24) {
+    return std::nullopt;
+  }
+
+  const double invNorm = 1.0 / std::sqrt(squaredNorm);
+  const Rot3 worldFromBody = Rot3::Quaternion(
+      event.worldFromBodyW * invNorm, event.worldFromBodyX * invNorm,
+      event.worldFromBodyY * invNorm, event.worldFromBodyZ * invNorm);
+  const Matrix3 rotation = worldFromBody.matrix();
+  const double roll = std::atan2(rotation(2, 1), rotation(2, 2));
+  const double pitch = std::asin(-rotation(2, 0));
+  const double yaw = std::atan2(rotation(1, 0), rotation(0, 0));
+  std::fprintf(stderr,
+               "[INIT ATTITUDE from ANYmal pose]  roll=%.4f  pitch=%.4f  "
+               "yaw=%.4f\n",
+               roll, pitch, yaw);
+  return NavState(worldFromBody, Point3(0.0, 0.0, 0.0), Vector3::Zero());
+}
+
+inline std::optional<NavState> accelerometerWindowInitializationNavState(
+    const std::vector<ImuSample>& samples, const ReplayConfig& replayConfig,
+    const std::string& /*source*/) {
+  if (samples.empty()) {
+    return std::nullopt;
+  }
+
+  Vector3 meanSpecificForce = Vector3::Zero();
+  for (const ImuSample& sample : samples) {
+    meanSpecificForce += sample.specificForce;
+  }
+  meanSpecificForce /= static_cast<double>(samples.size());
+
+  const double meanAccelNorm = meanSpecificForce.norm();
+  const double gravityMagnitude = replayConfig.gravity.norm();
+  if (meanAccelNorm <= 1.0e-9 || gravityMagnitude <= 1.0e-9) {
+    return std::nullopt;
+  }
+
+  const Vector3 accelDirection = meanSpecificForce / meanAccelNorm;
+  double pitch =
+      std::asin(std::clamp(-accelDirection.x(), -1.0, 1.0));
+  double roll = std::atan2(accelDirection.y(), accelDirection.z());
+  if (replayConfig.negateAccelStartupRollPitch) {
+    roll = -roll;
+    pitch = -pitch;
+  }
+  const double yaw = 0.0;
+  const Rot3 worldFromBody = Rot3::Ypr(yaw, pitch, roll);
+  return NavState(worldFromBody, Point3(0.0, 0.0, 0.0), Vector3::Zero());
+}
+
+inline Vector3 rollPitchYawFromAttitude(const Rot3& attitude) {
+  const Matrix3 rotation = attitude.matrix();
+  return Vector3(std::atan2(rotation(2, 1), rotation(2, 2)),
+                 std::asin(std::clamp(-rotation(2, 0), -1.0, 1.0)),
+                 std::atan2(rotation(1, 0), rotation(0, 0)));
+}
+
+inline Rot3 attitudeWithYawFrom(const Rot3& rollPitchAttitude,
+                                const Rot3& yawAttitude) {
+  const Vector3 rollPitchRpy =
+      rollPitchYawFromAttitude(rollPitchAttitude);
+  const double yaw = rollPitchYawFromAttitude(yawAttitude).z();
+  return Rot3::Ypr(yaw, rollPitchRpy.y(), rollPitchRpy.x());
+}
+
 inline double initialBiasWindowEndTime(const Dataset& dataset,
-                                       double startTime) {
-  double endTime = startTime + 1.0;
+                                       double startTime,
+                                       double windowSeconds) {
+  double endTime = startTime + windowSeconds;
   bool seenStart = false;
   for (const ContactEvent& event : dataset.contactEvents) {
     if (!seenStart) {
@@ -212,32 +338,114 @@ inline imuBias::ConstantBias estimateBiasFromSamples(
   return imuBias::ConstantBias(accelBias, meanOmega);
 }
 
+inline std::optional<imuBias::ConstantBias>
+estimateBiasFromSamplesUsingImuAttitude(
+    const std::vector<ImuSample>& samples,
+    const ReplayConfig& replayConfig) {
+  Vector3 meanOmega = Vector3::Zero();
+  Vector3 meanSpecificForce = Vector3::Zero();
+  Vector3 meanExpectedSpecificForce = Vector3::Zero();
+  size_t validCount = 0;
+  for (const ImuSample& sample : samples) {
+    if (!sample.hasAttitude) {
+      continue;
+    }
+    meanOmega += sample.omega;
+    meanSpecificForce += sample.specificForce;
+    meanExpectedSpecificForce +=
+        sample.attitude.unrotate(-replayConfig.gravity);
+    ++validCount;
+  }
+  if (validCount == 0) {
+    return std::nullopt;
+  }
+  const double denominator = static_cast<double>(validCount);
+  meanOmega /= denominator;
+  meanSpecificForce /= denominator;
+  meanExpectedSpecificForce /= denominator;
+  const Vector3 accelBias =
+      meanSpecificForce - meanExpectedSpecificForce;
+  std::fprintf(stderr,
+               "[IMU ORIENTATION BIAS] samples=%zu\n"
+               "  mean_accel     = [%9.6f, %9.6f, %9.6f] m/s²\n"
+               "  expected_accel = [%9.6f, %9.6f, %9.6f] m/s²\n"
+               "  accel_bias     = [%9.6f, %9.6f, %9.6f] m/s²\n",
+               validCount, meanSpecificForce.x(), meanSpecificForce.y(),
+               meanSpecificForce.z(), meanExpectedSpecificForce.x(),
+               meanExpectedSpecificForce.y(), meanExpectedSpecificForce.z(),
+               accelBias.x(), accelBias.y(), accelBias.z());
+  return imuBias::ConstantBias(accelBias, meanOmega);
+}
+
 inline InitialBiasEstimate estimateInitialImuBias(
-    const Dataset& dataset, const ReplayConfig& replayConfig) {
+    const Dataset& dataset, const ReplayConfig& replayConfig,
+    double biasWindowSeconds) {
   const std::optional<ContactEvent> event = firstFullContactEvent(dataset);
   if (!event) {
-    return {imuBias::ConstantBias(), "none", 0};
+    return {imuBias::ConstantBias(), "none", 0, {}, std::nullopt};
   }
-  const double endTime = initialBiasWindowEndTime(dataset, event->timestampS);
+  const double endTime = initialBiasWindowEndTime(
+      dataset, event->timestampS, biasWindowSeconds);
   const std::vector<ImuSample> postInitSamples =
       initialStationaryImuSamples(dataset, event->timestampS, endTime);
-  const NavState initialNavState =
-      fullContactInitializationNavState(replayConfig, event->activeContacts);
   if (samplesLookStationary(postInitSamples, replayConfig.gravity.norm())) {
-    return {
-        estimateBiasFromSamples(postInitSamples, initialNavState, replayConfig),
-        "post-init full-contact", postInitSamples.size()};
+    InitialBiasEstimate result;
+    const std::optional<NavState> accelNavState =
+        accelerometerWindowInitializationNavState(
+            postInitSamples, replayConfig, "post-init accelerometer window");
+    if (accelNavState) {
+      const auto imuAttitudeBias =
+          replayConfig.useImuOrientationForStartupBias
+              ? estimateBiasFromSamplesUsingImuAttitude(postInitSamples,
+                                                        replayConfig)
+              : std::nullopt;
+      const size_t validAttitudeSamples = static_cast<size_t>(std::count_if(
+          postInitSamples.begin(), postInitSamples.end(),
+          [](const ImuSample& sample) { return sample.hasAttitude; }));
+      result = {imuAttitudeBias.value_or(estimateBiasFromSamples(
+                    postInitSamples, *accelNavState, replayConfig)),
+                imuAttitudeBias ? "post-init IMU-orientation window"
+                                : "post-init accelerometer window",
+                imuAttitudeBias ? validAttitudeSamples : postInitSamples.size(),
+                postInitSamples, accelNavState};
+    } else {
+      result = {imuBias::ConstantBias(),
+                "none (invalid post-init accelerometer window)", 0, {},
+                std::nullopt};
+    }
+    return result;
   }
 
   const std::vector<ImuSample> preInitSamples =
       initialStaticImuSamplesBefore(dataset, event->timestampS);
-  return {
-      estimateBiasFromSamples(preInitSamples, initialNavState, replayConfig),
-      "pre-init static fallback", preInitSamples.size()};
-}
 
-inline InitialBiasEstimate estimateInitialImuBias(const Dataset& dataset) {
-  return estimateInitialImuBias(dataset, ReplayConfig());
+  InitialBiasEstimate result;
+  const std::optional<NavState> accelNavState =
+      accelerometerWindowInitializationNavState(
+          preInitSamples, replayConfig,
+          "pre-init accelerometer window fallback");
+  if (accelNavState) {
+    const auto imuAttitudeBias =
+        replayConfig.useImuOrientationForStartupBias
+            ? estimateBiasFromSamplesUsingImuAttitude(preInitSamples,
+                                                      replayConfig)
+            : std::nullopt;
+    const size_t validAttitudeSamples = static_cast<size_t>(std::count_if(
+        preInitSamples.begin(), preInitSamples.end(),
+        [](const ImuSample& sample) { return sample.hasAttitude; }));
+    result = {imuAttitudeBias.value_or(estimateBiasFromSamples(
+                  preInitSamples, *accelNavState, replayConfig)),
+              imuAttitudeBias
+                  ? "pre-init IMU-orientation window fallback"
+                  : "pre-init accelerometer window fallback",
+              imuAttitudeBias ? validAttitudeSamples : preInitSamples.size(),
+              preInitSamples, accelNavState};
+  } else {
+    result = {imuBias::ConstantBias(),
+              "none (invalid pre-init accelerometer window fallback)", 0, {},
+              std::nullopt};
+  }
+  return result;
 }
 
 inline LeggedEstimatorParams makeParams(
@@ -261,7 +469,16 @@ inline LeggedEstimatorParams makeParams(
 }
 
 inline NavState makeInitialState(const ReplayConfig& replayConfig) {
-  return NavState(Rot3(), replayConfig.initialPosition,
+  const Pose3 worldPBase(replayConfig.initialAttitude,
+                         replayConfig.initialPosition);
+  return NavState(worldPBase.rotation(), worldPBase.translation(),
+                  replayConfig.initialVelocity);
+}
+
+inline NavState makeInitialState(const ReplayConfig& replayConfig,
+                                 const Rot3& initialAttitude) {
+  const Pose3 worldPBase(initialAttitude, replayConfig.initialPosition);
+  return NavState(worldPBase.rotation(), worldPBase.translation(),
                   replayConfig.initialVelocity);
 }
 

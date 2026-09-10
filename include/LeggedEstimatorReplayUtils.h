@@ -47,6 +47,8 @@ struct ImuSample {
   double timestampS = 0.0;
   Vector3 omega = Vector3::Zero();
   Vector3 specificForce = Vector3::Zero();
+  bool hasAttitude = false;
+  Rot3 attitude = Rot3();
 };
 
 /// One contact event from the staircase example.
@@ -54,6 +56,12 @@ struct ContactEvent {
   size_t index = 0;
   double timestampS = 0.0;
   std::vector<ContactMeasurement> activeContacts;
+  std::vector<Vector3> worldRelativeContactPoints;
+  bool hasWorldFromBody = false;
+  double worldFromBodyW = 1.0;
+  double worldFromBodyX = 0.0;
+  double worldFromBodyY = 0.0;
+  double worldFromBodyZ = 0.0;
 };
 
 /// In-memory representation of the staircase example dataset.

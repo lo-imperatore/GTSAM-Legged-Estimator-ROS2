@@ -29,15 +29,41 @@ GTSAM_legged_estimator:
 
       # body_P_imu is the IMU pose expressed in the robot body frame.
       # Quaternion uses ROS order [x, y, z, w].
-      body_p_imu_xyz: [0.0, 0.0, 0.0]
-      body_q_imu_xyzw: [0.0, 0.0, 0.0, 1.0]
+      body_p_imu_xyz: [0.30, 0.0, 0.15]
+      # body_q_imu_xyzw: [0.0, 0.0, 0.0, 1.0]
+      # body_q_imu_xyzw: [0.03015, 0.02380, 0.71398, 0.69911] #mocap E
+      body_q_imu_xyzw: [0.03418, 0.02719, 0.70994, 0.70291]
+      # body_q_imu_xyzw: [-0.00167, 0.00916, 0.000015, 0.999957]
+      # body_q_imu_xyzw: [-0.00167, 0.00151, 0.000002, 0.999997]
+      # body_q_imu_xyzw: [-0.001658, 0.013090, 0.0000217, 0.999913]
+      # body_q_imu_xyzw: [0.00028, 0.00513, 0.0, 0.999987]
 
       use_joint_fk_for_body_point: true
-      joint_fk_fallback_to_msg_body_point: true
+      joint_fk_fallback_to_msg_body_point: false
       joint_fk_max_joint_age_seconds: 0.05
       spot_fk_position_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 
     conversion:
+      # Reconstruct GRF from /joint_states and apply the same stateful contact
+      # classifier used by ANYmal. Set to "state" to use FootState.contact.
+      spot_contact_classifier: joint_torque_grf
+      spot_contact_force_on: 90.0
+      spot_contact_force_off: 20.0
+      spot_contact_max_force_delta: 40.0
+      spot_contact_force_window_size: 4
+      spot_contact_on_samples: 6
+      spot_contact_use_force_window: false
+      spot_contact_force_delta_off_samples: 2
+      spot_contact_use_absolute_force_z: true
+      spot_joint_torque_grf_damping: 0.02
+      spot_joint_torque_scale: 1.0
+      # URDF inertias provide gravity and velocity-bias compensation.
+      spot_urdf_path: /ros2_ws/src/spot_description/spot_description/urdf/spot_pronto_simple.urdf.xacro
+      # Convert the URDF foot-center frame to Spot's reported contact point.
+      # Derived from all 16,759 synchronized samples in the Atrium bag.
+      spot_contact_point_z_offset: -0.03
+
+      # Used only when spot_contact_classifier is "state".
       # FootState.msg defines CONTACT_MADE=1 and CONTACT_LOST=2.
       contact_stream_mode: transition
       contact_state_value: 1
@@ -45,32 +71,46 @@ GTSAM_legged_estimator:
       contact_lost_code: 2
 
     estimator:
-      variants: [invariant_ekf]  # exactly one of: invariant_ekf, invariant_graph, fixed_lag_single_bias, fixed_lag_combined_bias
+      variants: [fixed_lag_combined_bias]
       output_dir: ./outputs/live
+      initial_position_xyz: [0.0, 0.0, 0.0]
+      initial_orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
       max_duration_seconds: 0.0
       lag_seconds: 1.0
-      max_dead_reckoning_seconds: 0.100
+      max_dead_reckoning_seconds: 0.200
       sigma_acc: 0.020
-      bias_acc_random_walk_sigma: 0.005
-      bias_omega_random_walk_sigma: 0.0001
-      contact_sigma_xy: 0.030
-      contact_sigma_z: 0.020
+      bias_acc_random_walk_sigma: 0.05
+      bias_omega_random_walk_sigma: 0.0005
+      contact_sigma_xy: 0.08
+      contact_sigma_z: 0.04
       use_robust_contact_noise: false
       robust_contact_huber_k: 2.0
       marginalize_leaving_foot: true
       disable_full_contact_initialization: false
-      startup_bias_window_seconds: 1.0
+      startup_bias_window_seconds: 2.5
       startup_timeout_seconds: 5.0
+      # Set false to use these values instead of the online startup estimate.
+      bias_recalc_at_start: true
+      # False estimates startup roll/pitch from the stationary accelerometer
+      # window before calculating bias. True preserves the level-body mode.
+      spot_force_zero_startup_roll_pitch: false
+      # Apply the opposite sign convention to accelerometer-derived attitude.
+      negate_accel_startup_roll_pitch: false
+      # Use the orientation reported in sensor_msgs/Imu to rotate gravity into
+      # the body frame before calculating measured-minus-expected accel bias.
+      use_imu_orientation_for_startup_bias: true
+      manual_imu_bias_acc: [-0.015, 0.0, -0.013]
+      manual_imu_bias_gyro: [-0.0003766, 0.0001154, 0.0007625]
 
     qos:
       reliability: best_effort
       depth: 1000
-      reorder_delay_seconds: 0.1
+      reorder_delay_seconds: 0.135
 
     publish_odom: true
-    publish_path: true
-    publish_foot_contacts: true
-    foot_contact_touchdowns_only: false
+    publish_path: false
+    publish_foot_contacts: false
+    foot_contact_touchdowns_only: true
     foot_contact_marker_scale: 0.12
     foot_contact_marker_z_offset: 0.03
     foot_contact_max_points: 5000

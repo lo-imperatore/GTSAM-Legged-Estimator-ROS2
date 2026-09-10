@@ -16,12 +16,18 @@
 
 #include <builtin_interfaces/msg/time.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#ifdef GTSAM_LEGGED_HAVE_ANYMAL_MSGS
+#include <legged_estimator_msgs/msg/anymal_contact_diagnostics.hpp>
+#include <legged_estimator_msgs/msg/spot_contact_diagnostics.hpp>
+#include <legged_estimator_msgs/msg/estimator_imu_bias.hpp>
+#endif
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/serialized_message.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include <algorithm>
@@ -33,6 +39,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -44,9 +51,14 @@
 #include <utility>
 #include <vector>
 
+#ifdef GTSAM_LEGGED_HAVE_ANYMAL_MSGS
 #include "include/AnymalContactAdapter.h"
+#endif
 #include "include/LeggedEstimatorCore.h"
 #include "include/SpotContactAdapter.h"
+#ifdef GTSAM_LEGGED_HAVE_UNITREE_HG
+#include "include/UnitreeG1Adapter.h"
+#endif
 
 namespace gtsam {
 namespace {
@@ -152,16 +164,30 @@ std::string normalizeRobotType(std::string value) {
                  [](const unsigned char c) {
                    return static_cast<char>(std::tolower(c));
                  });
-  if (value != "spot" && value != "anymal") {
-    throw std::runtime_error("robot.type must be either 'spot' or 'anymal'");
+  if (value != "spot" && value != "anymal" && value != "g1") {
+    throw std::runtime_error(
+        "robot.type must be one of 'spot', 'anymal', or 'g1'");
   }
+#ifndef GTSAM_LEGGED_HAVE_ANYMAL_MSGS
+  if (value == "anymal") {
+    throw std::runtime_error(
+        "robot.type=anymal requires the any_msgs and anymal_msgs packages");
+  }
+#endif
+#ifndef GTSAM_LEGGED_HAVE_UNITREE_HG
+  if (value == "g1") {
+    throw std::runtime_error(
+        "robot.type=g1 requires the unitree_hg ROS 2 message package");
+  }
+#endif
   return value;
 }
 
 class VariantRunner {
  public:
-  using StateCallback =
-      std::function<void(const std::string&, double, const NavState&)>;
+  using StateCallback = std::function<void(
+      const std::string&, double, const NavState&,
+      const imuBias::ConstantBias&, const Vector3&)>;
   using ContactCallback =
       std::function<void(const std::string&, double, const ExtendedPose3d&,
                          const std::vector<ContactMeasurement>&)>;
@@ -169,15 +195,22 @@ class VariantRunner {
   VariantRunner(std::string filterName, DatasetMetadata metadata,
                 ReplayConfig replayConfig, double maxDurationSeconds,
                 bool disableFullContactInitialization,
+                std::optional<NavState> startupInitialState,
                 StateCallback stateCallback, ContactCallback contactCallback)
       : filterName_(std::move(filterName)),
         metadata_(std::move(metadata)),
         replayConfig_(std::move(replayConfig)),
         maxDurationSeconds_(maxDurationSeconds),
         disableFullContactInitialization_(disableFullContactInitialization),
+        startupInitialStateWasEstimated_(startupInitialState.has_value()),
         stateCallback_(std::move(stateCallback)),
         contactCallback_(std::move(contactCallback)),
-        initialState_(makeInitialState(replayConfig_)),
+        initialState_(startupInitialState
+                          ? makeInitialState(replayConfig_,
+                                             attitudeWithYawFrom(
+                                                 startupInitialState->attitude(),
+                                                 replayConfig_.initialAttitude))
+                          : makeInitialState(replayConfig_)),
         previousLoggedState_(initialState_) {}
 
   void start(const fs::path& outputDir,
@@ -186,7 +219,9 @@ class VariantRunner {
     const Matrix covariance =
         makeInitialCovariance(metadata_.footNames.size(), replayConfig_);
     const Matrix9 baseCovariance = makeInitialBaseCovariance(replayConfig_);
-    params_ = makeParams(replayConfig_, disableFullContactInitialization_,
+    const bool preserveStartupInitialState =
+        disableFullContactInitialization_ || startupInitialStateWasEstimated_;
+    params_ = makeParams(replayConfig_, preserveStartupInitialState,
                          imuBiasEstimate);
     estimator_ = makeEstimator(filterName_, metadata_.footNames, initialState_,
                                footholds, covariance, baseCovariance, params_,
@@ -334,7 +369,7 @@ class VariantRunner {
     logState(status == ContactPacketStatus::kUsedTouchdown
                  ? "touchdown_contact"
                  : "periodic_contact",
-             currentTime_);
+             currentTime_, false);
   }
 
   void advanceTo(double timestampS) {
@@ -349,7 +384,8 @@ class VariantRunner {
     }
   }
 
-  void logState(const std::string& kind, double timestampS) {
+  void logState(const std::string& kind, double timestampS,
+                bool publishState = true) {
     if (!loggingEnabled_) {
       return;
     }
@@ -366,8 +402,9 @@ class VariantRunner {
     havePreviousLoggedState_ = true;
     ++trajectoryRows_;
 
-    if (stateCallback_) {
-      stateCallback_(filterName_, timestampS, state);
+    if (publishState && stateCallback_) {
+      stateCallback_(filterName_, timestampS, state,
+                     estimator_->estimateBias(), heldImu_.omega);
     }
   }
 
@@ -376,6 +413,7 @@ class VariantRunner {
   ReplayConfig replayConfig_;
   double maxDurationSeconds_;
   bool disableFullContactInitialization_ = false;
+  bool startupInitialStateWasEstimated_ = false;
   StateCallback stateCallback_;
   ContactCallback contactCallback_;
 
@@ -437,7 +475,12 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
     robotType_ = normalizeRobotType(declare_parameter<std::string>(
         "robot.type", legacyUseAnymalContacts ? "anymal" : "spot"));
     SpotContactAdapter::Options spotOptions;
+#ifdef GTSAM_LEGGED_HAVE_ANYMAL_MSGS
     AnymalContactAdapter::Options anymalOptions;
+#endif
+#ifdef GTSAM_LEGGED_HAVE_UNITREE_HG
+    UnitreeG1Adapter::Options g1Options;
+#endif
     if (robotType_ == "spot") {
       spotFootTopic_ =
           declare_parameter<std::string>("topics.foot", "/spot/status/feet");
@@ -447,9 +490,14 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
           "topics.joint_states", "/joint_states");
       readJointStates_ =
           declare_parameter<bool>("topics.read_joint_states", true);
-    } else {
+#ifdef GTSAM_LEGGED_HAVE_ANYMAL_MSGS
+    } else if (robotType_ == "anymal") {
       anymalStateTopic_ =
           declare_parameter<std::string>("topics.anymal_state", "/state");
+#endif
+    } else {
+      g1LowStateTopic_ =
+          declare_parameter<std::string>("topics.low_state", "/lowstate");
     }
     odomTopicPrefix_ =
         declare_parameter<std::string>("topics.odom_prefix", "/legged_estimator");
@@ -503,9 +551,32 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
           "calibration.joint_fk_fallback_to_msg_body_point", true);
       spotOptions.jointFkMaxJointAgeSeconds = declare_parameter<double>(
           "calibration.joint_fk_max_joint_age_seconds", 0.05);
-    } else {
+#ifdef GTSAM_LEGGED_HAVE_ANYMAL_MSGS
+    } else if (robotType_ == "anymal") {
       anymalOptions.footNames = footNames_;
       anymalOptions.legImuOffsets = legImuOffsets_;
+#endif
+#ifdef GTSAM_LEGGED_HAVE_UNITREE_HG
+    } else {
+      g1Options.footNames = footNames_;
+      g1Options.legImuOffsets = legImuOffsets_;
+      const std::vector<int64_t> motorIndices =
+          declare_parameter<std::vector<int64_t>>(
+              "calibration.g1_leg_motor_indices",
+              {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
+      if (motorIndices.size() != g1Options.legMotorIndices.size()) {
+        throw std::runtime_error(
+            "calibration.g1_leg_motor_indices must contain 12 values");
+      }
+      for (size_t index = 0; index < motorIndices.size(); ++index) {
+        if (motorIndices[index] < 0 || motorIndices[index] >= 35) {
+          throw std::runtime_error(
+              "calibration.g1_leg_motor_indices values must be in [0, 34]");
+        }
+        g1Options.legMotorIndices[index] =
+            static_cast<size_t>(motorIndices[index]);
+      }
+#endif
     }
 
     const std::vector<double> bodyPImuXyz =
@@ -522,9 +593,16 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
         Rot3::Quaternion(bodyQImuXyzw[3], bodyQImuXyzw[0],
                          bodyQImuXyzw[1], bodyQImuXyzw[2]),
         Point3(bodyPImuXyz[0], bodyPImuXyz[1], bodyPImuXyz[2]));
+    // The navigation state is base_link-centred.  Keep the physical IMU
+    // extrinsic in bodyPImu_ for converting sensor samples, but give the
+    // estimator an identity body-to-state transform: contact measurements,
+    // pose, and velocity are all expressed at/in base_link.
     replayConfig_.body_P_imu = Pose3();
 
     if (robotType_ == "spot") {
+      spotOptions.contactClassifier = declare_parameter<std::string>(
+          "conversion.spot_contact_classifier", "state");
+      spotContactClassifier_ = spotOptions.contactClassifier;
       spotOptions.contactStreamMode =
           declare_parameter<std::string>("conversion.contact_stream_mode",
                                          "transition");
@@ -534,11 +612,106 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
           declare_parameter<int>("conversion.contact_made_code", 1);
       spotOptions.contactLostCode =
           declare_parameter<int>("conversion.contact_lost_code", 2);
-    } else {
+      if (spotOptions.contactClassifier == "joint_torque_grf") {
+        spotOptions.contactForceOn = declare_parameter<double>(
+            "conversion.spot_contact_force_on", 70.0);
+        spotOptions.contactForceOff = declare_parameter<double>(
+            "conversion.spot_contact_force_off", 50.0);
+        spotOptions.contactMaxForceDelta = declare_parameter<double>(
+            "conversion.spot_contact_max_force_delta", 40.0);
+        const int64_t windowSize = declare_parameter<int64_t>(
+            "conversion.spot_contact_force_window_size", 4);
+        const int64_t onSamples = declare_parameter<int64_t>(
+            "conversion.spot_contact_on_samples", 4);
+        spotOptions.contactUseForceWindow = declare_parameter<bool>(
+            "conversion.spot_contact_use_force_window", false);
+        const int64_t offSamples = declare_parameter<int64_t>(
+            "conversion.spot_contact_force_delta_off_samples", 3);
+        spotOptions.contactUseAbsoluteForceZ = declare_parameter<bool>(
+            "conversion.spot_contact_use_absolute_force_z", true);
+        spotOptions.jointTorqueGrfDamping = declare_parameter<double>(
+            "conversion.spot_joint_torque_grf_damping", 0.02);
+        spotOptions.jointTorqueScale = declare_parameter<double>(
+            "conversion.spot_joint_torque_scale", 1.0);
+        spotOptions.urdfPath = declare_parameter<std::string>(
+            "conversion.spot_urdf_path",
+            "/ros2_ws/src/GTSAM-Legged-Estimator-ROS2/spot_description/"
+            "spot_description/urdf/spot_pronto_simple.urdf.xacro");
+        spotOptions.contactPointZOffset = declare_parameter<double>(
+            "conversion.spot_contact_point_z_offset", -0.03305);
+        if (windowSize < 1 || onSamples < 1 || offSamples < 1) {
+          throw std::runtime_error(
+              "Spot contact classifier sample counts must be positive");
+        }
+        spotOptions.contactForceWindowSize = static_cast<size_t>(windowSize);
+        spotOptions.contactOnSamples = static_cast<size_t>(onSamples);
+        spotOptions.contactForceDeltaOffSamples =
+            static_cast<size_t>(offSamples);
+      }
+#ifdef GTSAM_LEGGED_HAVE_ANYMAL_MSGS
+    } else if (robotType_ == "anymal") {
       anymalOptions.slippingIsContact = declare_parameter<bool>(
           "conversion.anymal_slipping_is_contact", true);
       anymalOptions.requireStateOk = declare_parameter<bool>(
           "conversion.anymal_require_state_ok", false);
+      anymalOptions.contactClassifier = declare_parameter<std::string>(
+          "conversion.anymal_contact_classifier", "joint_torque_grf");
+      anymalContactClassifier_ = anymalOptions.contactClassifier;
+      if (anymalOptions.contactClassifier == "joint_torque_grf") {
+        anymalOptions.contactForceOn = declare_parameter<double>(
+            "conversion.anymal_contact_force_on", 130.0);
+        anymalOptions.contactForceOff = declare_parameter<double>(
+            "conversion.anymal_contact_force_off", 100.0);
+        anymalOptions.contactMaxForceDelta = declare_parameter<double>(
+            "conversion.anymal_contact_max_force_delta", 40.0);
+        const int64_t anymalForceWindowSize = declare_parameter<int64_t>(
+            "conversion.anymal_contact_force_window_size", 4);
+        const int64_t anymalOnSamples = declare_parameter<int64_t>(
+            "conversion.anymal_contact_on_samples", 12);
+        anymalOptions.contactUseForceWindow = declare_parameter<bool>(
+            "conversion.anymal_contact_use_force_window", false);
+        const int64_t anymalDeltaOffSamples = declare_parameter<int64_t>(
+            "conversion.anymal_contact_force_delta_off_samples", 1);
+        anymalOptions.contactUseAbsoluteForceZ = declare_parameter<bool>(
+            "conversion.anymal_contact_use_absolute_force_z", true);
+        anymalOptions.jointTorqueGrfDamping = declare_parameter<double>(
+            "conversion.anymal_joint_torque_grf_damping", 0.02);
+        anymalOptions.jointTorqueScale = declare_parameter<double>(
+            "conversion.anymal_joint_torque_scale", 1.0);
+        anymalOptions.anymalUrdfPath = declare_parameter<std::string>(
+            "conversion.anymal_urdf_path",
+            "/ros2_ws/src/anymal_d_simple_description/urdf/anymal.urdf");
+        if (anymalForceWindowSize < 1 || anymalOnSamples < 1 ||
+            anymalDeltaOffSamples < 1) {
+          throw std::runtime_error(
+              "ANYmal contact classifier sample counts must be positive");
+        }
+        anymalOptions.contactForceWindowSize =
+            static_cast<size_t>(anymalForceWindowSize);
+        anymalOptions.contactOnSamples = static_cast<size_t>(anymalOnSamples);
+        anymalOptions.contactForceDeltaOffSamples =
+            static_cast<size_t>(anymalDeltaOffSamples);
+      }
+#endif
+#ifdef GTSAM_LEGGED_HAVE_UNITREE_HG
+    } else {
+      g1Options.contactForceOn = declare_parameter<double>(
+          "conversion.g1_contact_force_on", 40.0);
+      g1Options.contactForceOff = declare_parameter<double>(
+          "conversion.g1_contact_force_off", 20.0);
+      g1Options.contactForceFilterAlpha = declare_parameter<double>(
+          "conversion.g1_contact_force_filter_alpha", 0.2);
+      g1Options.wrenchDamping = declare_parameter<double>(
+          "conversion.g1_wrench_damping", 0.01);
+      g1Options.maxValidContactForce = declare_parameter<double>(
+          "conversion.g1_max_valid_contact_force", 2000.0);
+      g1Options.useHeightGuard = declare_parameter<bool>(
+          "conversion.g1_use_height_guard", false);
+      g1Options.contactHeightTolerance = declare_parameter<double>(
+          "conversion.g1_contact_height_tolerance", 0.025);
+      g1Options.contactReleaseHeight = declare_parameter<double>(
+          "conversion.g1_contact_release_height", 0.045);
+#endif
     }
 
     filterNames_ = declare_parameter<std::vector<std::string>>(
@@ -550,6 +723,24 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
     }
     outputDir_ =
         declare_parameter<std::string>("estimator.output_dir", "./outputs/live");
+
+    const std::vector<double> initialPositionXyz =
+        checkedDoubleVector(declare_parameter<std::vector<double>>(
+                                "estimator.initial_position_xyz",
+                                {0.0, 0.0, 0.0}),
+                            3, "estimator.initial_position_xyz");
+    replayConfig_.initialPosition =
+        Point3(initialPositionXyz[0], initialPositionXyz[1],
+               initialPositionXyz[2]);
+    const std::vector<double> initialOrientationXyzw =
+        checkedQuaternionXyzw(declare_parameter<std::vector<double>>(
+                                  "estimator.initial_orientation_xyzw",
+                                  {0.0, 0.0, 0.0, 1.0}),
+                              "estimator.initial_orientation_xyzw");
+    replayConfig_.initialAttitude =
+        Rot3::Quaternion(initialOrientationXyzw[3], initialOrientationXyzw[0],
+                         initialOrientationXyzw[1],
+                         initialOrientationXyzw[2]);
 
     const double maxDuration =
         declare_parameter<double>("estimator.max_duration_seconds", 0.0);
@@ -563,6 +754,10 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
         replayConfig_.maxDeadReckoningSeconds);
     replayConfig_.sigmaAcc =
         declare_parameter<double>("estimator.sigma_acc", replayConfig_.sigmaAcc);
+    replayConfig_.negateAccelStartupRollPitch = declare_parameter<bool>(
+        "estimator.negate_accel_startup_roll_pitch", false);
+    replayConfig_.useImuOrientationForStartupBias = declare_parameter<bool>(
+        "estimator.use_imu_orientation_for_startup_bias", false);
     replayConfig_.biasAccRandomWalkSigma = declare_parameter<double>(
         "estimator.bias_acc_random_walk_sigma",
         replayConfig_.biasAccRandomWalkSigma);
@@ -592,8 +787,32 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
         "estimator.disable_full_contact_initialization", false);
     startupBiasWindowSeconds_ =
         declare_parameter<double>("estimator.startup_bias_window_seconds", 1.0);
+    if (!std::isfinite(startupBiasWindowSeconds_) ||
+        startupBiasWindowSeconds_ <= 0.0) {
+      throw std::runtime_error(
+          "estimator.startup_bias_window_seconds must be positive and finite");
+    }
     startupTimeoutSeconds_ =
         declare_parameter<double>("estimator.startup_timeout_seconds", 5.0);
+    biasRecalcAtStart_ =
+        declare_parameter<bool>("estimator.bias_recalc_at_start", true);
+    spotForceZeroStartupRollPitch_ = declare_parameter<bool>(
+        "estimator.spot_force_zero_startup_roll_pitch", false);
+    const std::vector<double> manualImuBiasAcc =
+        checkedDoubleVector(declare_parameter<std::vector<double>>(
+                                "estimator.manual_imu_bias_acc",
+                                {0.0, 0.0, 0.0}),
+                            3, "estimator.manual_imu_bias_acc");
+    const std::vector<double> manualImuBiasGyro =
+        checkedDoubleVector(declare_parameter<std::vector<double>>(
+                                "estimator.manual_imu_bias_gyro",
+                                {0.0, 0.0, 0.0}),
+                            3, "estimator.manual_imu_bias_gyro");
+    manualImuBias_ = imuBias::ConstantBias(
+        Vector3(manualImuBiasAcc[0], manualImuBiasAcc[1],
+                manualImuBiasAcc[2]),
+        Vector3(manualImuBiasGyro[0], manualImuBiasGyro[1],
+                manualImuBiasGyro[2]));
 
     const std::string reliability =
         declare_parameter<std::string>("qos.reliability", "best_effort");
@@ -634,9 +853,15 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
     if (robotType_ == "spot") {
       spotContactAdapter_ =
           std::make_unique<SpotContactAdapter>(std::move(spotOptions));
-    } else {
+#ifdef GTSAM_LEGGED_HAVE_ANYMAL_MSGS
+    } else if (robotType_ == "anymal") {
       anymalContactAdapter_ =
           std::make_unique<AnymalContactAdapter>(std::move(anymalOptions));
+#endif
+#ifdef GTSAM_LEGGED_HAVE_UNITREE_HG
+    } else {
+      g1Adapter_ = std::make_unique<UnitreeG1Adapter>(std::move(g1Options));
+#endif
     }
   }
 
@@ -652,22 +877,35 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
 
   void setupRosInterfaces() {
     const rclcpp::QoS qos = makeQos();
-    imuSub_ = create_subscription<Imu>(
-        imuTopic_, qos,
-        [this](const Imu::SharedPtr msg) { handleImu(*msg); });
+    if (robotType_ != "g1") {
+      imuSub_ = create_subscription<Imu>(
+          imuTopic_, qos,
+          [this](const Imu::SharedPtr msg) { handleImu(*msg); });
+    }
     if (spotContactAdapter_ && readJointStates_) {
+      spotContactDiagnosticsPublisher_ =
+          create_publisher<legged_estimator_msgs::msg::SpotContactDiagnostics>(
+              outputTopic("spot_contact_diagnostics"), 10);
       jointStateSub_ = create_subscription<JointState>(
           jointStatesTopic_, qos,
           [this](const JointState::SharedPtr msg) { handleJointState(*msg); });
     }
-    if (spotContactAdapter_) {
+    imuBiasPublisher_ =
+        create_publisher<legged_estimator_msgs::msg::EstimatorImuBias>(
+            outputTopic("imu_bias"), 10);
+    if (spotContactAdapter_ && spotContactAdapter_->usesFootContactMessages()) {
       footSub_ = create_generic_subscription(
           spotFootTopic_, spotContactAdapter_->footType(), qos,
           [this](std::shared_ptr<rclcpp::SerializedMessage> msg) {
             handleFootSerialized(msg);
           });
     }
+#ifdef GTSAM_LEGGED_HAVE_ANYMAL_MSGS
     if (anymalContactAdapter_) {
+      anymalContactDiagnosticsPublisher_ =
+          create_publisher<
+              legged_estimator_msgs::msg::AnymalContactDiagnostics>(
+              outputTopic("anymal_contact_diagnostics"), 10);
       anymalStateSub_ =
           create_subscription<anymal_msgs::msg::AnymalState>(
               anymalStateTopic_, qos,
@@ -675,6 +913,19 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
                 handleAnymalState(*msg);
               });
     }
+#endif
+#ifdef GTSAM_LEGGED_HAVE_UNITREE_HG
+    if (g1Adapter_) {
+      g1LowStateSub_ = create_subscription<unitree_hg::msg::LowState>(
+          g1LowStateTopic_, qos,
+          [this](const unitree_hg::msg::LowState::SharedPtr msg) {
+            handleG1LowState(*msg);
+          });
+      g1ContactDebugPublisher_ =
+          create_publisher<std_msgs::msg::Float64MultiArray>(
+              outputTopic("g1_contact_debug"), 10);
+    }
+#endif
 
     const rclcpp::QoS pathQos =
         rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
@@ -725,13 +976,29 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
                   kAnsiBold, kAnsiBlue, kAnsiReset, spotFootTopic_.c_str(),
                   spotContactAdapter_->footType().c_str(),
                   readJointStates_ ? jointStatesTopic_.c_str() : "disabled");
+      RCLCPP_INFO(get_logger(), "%s%sSpot contact classifier%s: %s",
+                  kAnsiBold, kAnsiBlue, kAnsiReset,
+                  spotContactClassifier_.c_str());
     }
+#ifdef GTSAM_LEGGED_HAVE_ANYMAL_MSGS
     if (anymalContactAdapter_) {
       RCLCPP_INFO(get_logger(),
                   "%s%sANYmal contact input%s: anymal_state=%s",
                   kAnsiBold, kAnsiBlue, kAnsiReset,
                   anymalStateTopic_.c_str());
+      RCLCPP_INFO(get_logger(), "%s%sANYmal contact classifier%s: %s",
+                  kAnsiBold, kAnsiBlue, kAnsiReset,
+                  anymalContactClassifier_.c_str());
     }
+#endif
+#ifdef GTSAM_LEGGED_HAVE_UNITREE_HG
+    if (g1Adapter_) {
+      RCLCPP_INFO(get_logger(),
+                  "%s%sUnitree G1 input%s: low_state=%s (embedded IMU)",
+                  kAnsiBold, kAnsiBlue, kAnsiReset,
+                  g1LowStateTopic_.c_str());
+    }
+#endif
   }
 
   void handleImu(const Imu& msg) {
@@ -747,12 +1014,63 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
                                    msg.linear_acceleration.z);
     event.imu.omega = bodyRImu.rotate(omegaImu);
     event.imu.specificForce = bodyRImu.rotate(specificForceImu);
+    const double quaternionSquaredNorm =
+        msg.orientation.w * msg.orientation.w +
+        msg.orientation.x * msg.orientation.x +
+        msg.orientation.y * msg.orientation.y +
+        msg.orientation.z * msg.orientation.z;
+    const bool orientationDeclaredValid =
+        msg.orientation_covariance[0] >= 0.0;
+    if (orientationDeclaredValid && quaternionSquaredNorm > 1.0e-24) {
+      const double inverseNorm = 1.0 / std::sqrt(quaternionSquaredNorm);
+      const Rot3 worldRImu = Rot3::Quaternion(
+          msg.orientation.w * inverseNorm,
+          msg.orientation.x * inverseNorm,
+          msg.orientation.y * inverseNorm,
+          msg.orientation.z * inverseNorm);
+      event.imu.hasAttitude = true;
+      event.imu.attitude = Rot3(
+          worldRImu.matrix() * bodyRImu.inverse().matrix());
+    }
     enqueueEvent(std::move(event));
   }
 
   void handleJointState(const JointState& msg) {
     if (spotContactAdapter_) {
-      spotContactAdapter_->updateJointState(msg);
+      if (spotContactAdapter_->usesFootContactMessages()) {
+        spotContactAdapter_->updateJointState(msg);
+        return;
+      }
+      SpotContactAdapter::Diagnostics diagnostics;
+      std::optional<ContactEvent> contactEvent =
+          spotContactAdapter_->makeJointTorqueGrfContactEvent(
+              msg, nextContactIndex_, &diagnostics);
+      if (spotContactDiagnosticsPublisher_) {
+        legged_estimator_msgs::msg::SpotContactDiagnostics output;
+        output.header = msg.header;
+        output.feet.reserve(diagnostics.feet.size());
+        for (size_t foot = 0; foot < diagnostics.feet.size(); ++foot) {
+          const auto& source = diagnostics.feet[foot];
+          legged_estimator_msgs::msg::SpotFootContactDiagnostic entry;
+          entry.foot_index = static_cast<uint32_t>(foot);
+          entry.foot_name = source.footName;
+          entry.valid = source.valid;
+          entry.grf_z = source.grfZ;
+          entry.classifier_force = source.classifierForce;
+          entry.classified_contact = source.classifiedContact;
+          output.feet.push_back(std::move(entry));
+        }
+        spotContactDiagnosticsPublisher_->publish(output);
+      }
+      if (!contactEvent) {
+        return;
+      }
+      ++nextContactIndex_;
+      LiveEvent event;
+      event.type = LiveEvent::Type::kContact;
+      event.timestampS = contactEvent->timestampS;
+      event.contact = std::move(*contactEvent);
+      enqueueEvent(std::move(event));
     }
   }
 
@@ -782,13 +1100,36 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
     }
   }
 
+#ifdef GTSAM_LEGGED_HAVE_ANYMAL_MSGS
   void handleAnymalState(const anymal_msgs::msg::AnymalState& msg) {
     if (!anymalContactAdapter_) {
       return;
     }
     try {
+      AnymalContactAdapter::Diagnostics diagnostics;
       std::optional<ContactEvent> contactEvent =
-          anymalContactAdapter_->makeContactEvent(msg, nextContactIndex_);
+          anymalContactAdapter_->makeContactEvent(
+              msg, nextContactIndex_, &diagnostics);
+      if (anymalContactDiagnosticsPublisher_) {
+        legged_estimator_msgs::msg::AnymalContactDiagnostics output;
+        output.header = msg.header;
+        output.feet.reserve(diagnostics.feet.size());
+        for (size_t foot = 0; foot < diagnostics.feet.size(); ++foot) {
+          const AnymalContactAdapter::FootDiagnostic& source =
+              diagnostics.feet[foot];
+          legged_estimator_msgs::msg::AnymalFootContactDiagnostic entry;
+          entry.foot_index = static_cast<uint32_t>(foot);
+          entry.foot_name = source.footName;
+          entry.has_estimated_grf = source.hasEstimatedGrf;
+          entry.estimated_grf_z = source.estimatedGrfZ;
+          entry.classified_contact = source.classifiedContact;
+          entry.has_measured_contact = source.hasMeasuredContact;
+          entry.measured_wrench_z = source.measuredWrenchZ;
+          entry.measured_contact_state = source.measuredContactState;
+          output.feet.push_back(std::move(entry));
+        }
+        anymalContactDiagnosticsPublisher_->publish(output);
+      }
       if (!contactEvent) {
         return;
       }
@@ -807,6 +1148,68 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
       }
     }
   }
+#endif
+
+#ifdef GTSAM_LEGGED_HAVE_UNITREE_HG
+  void handleG1LowState(const unitree_hg::msg::LowState& msg) {
+    if (!g1Adapter_) {
+      return;
+    }
+    try {
+      // LowState has no ROS Header. Using the ROS receive time keeps its
+      // embedded IMU and derived contact packet on one clock.
+      const double timestampS = now().seconds();
+      UnitreeG1Adapter::Result converted = g1Adapter_->convert(
+          msg, timestampS, nextImuIndex_, nextContactIndex_);
+
+      if (g1ContactDebugPublisher_) {
+        std_msgs::msg::Float64MultiArray debug;
+        debug.layout.dim.resize(1);
+        debug.layout.dim[0].label =
+            "left_raw_N,right_raw_N,left_filtered_N,right_filtered_N,"
+            "left_threshold_N,right_threshold_N,left_contact,right_contact";
+        debug.layout.dim[0].size = 8;
+        debug.layout.dim[0].stride = 8;
+        debug.data = {
+            converted.rawVerticalForces[0],
+            converted.rawVerticalForces[1],
+            converted.filteredVerticalForces[0],
+            converted.filteredVerticalForces[1],
+            converted.activeThresholds[0],
+            converted.activeThresholds[1],
+            converted.contactsActive[0] ? 1.0 : 0.0,
+            converted.contactsActive[1] ? 1.0 : 0.0};
+        g1ContactDebugPublisher_->publish(debug);
+      }
+
+      LiveEvent imuEvent;
+      imuEvent.type = LiveEvent::Type::kImu;
+      imuEvent.timestampS = timestampS;
+      const Rot3 bodyRImu = bodyPImu_.rotation();
+      converted.imu.omega = bodyRImu.rotate(converted.imu.omega);
+      converted.imu.specificForce =
+          bodyRImu.rotate(converted.imu.specificForce);
+      imuEvent.imu = converted.imu;
+      enqueueEvent(std::move(imuEvent));
+
+      if (converted.contact) {
+        ++nextContactIndex_;
+        LiveEvent contactEvent;
+        contactEvent.type = LiveEvent::Type::kContact;
+        contactEvent.timestampS = timestampS;
+        contactEvent.contact = std::move(*converted.contact);
+        enqueueEvent(std::move(contactEvent));
+      }
+    } catch (const std::exception& error) {
+      if (!reportedG1ParseError_) {
+        reportedG1ParseError_ = true;
+        RCLCPP_ERROR(get_logger(), "Failed to convert Unitree G1 LowState: %s",
+                     error.what());
+      }
+    }
+  }
+
+#endif
 
   void enqueueEvent(LiveEvent event) {
     std::lock_guard<std::mutex> lock(queueMutex_);
@@ -948,26 +1351,59 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
 
     InitialBiasEstimate imuBiasEstimate;
     if (firstFullContactEvent(dataset)) {
-      imuBiasEstimate = estimateInitialImuBias(dataset, replayConfig_);
+      imuBiasEstimate = estimateInitialImuBias(
+          dataset, replayConfig_, startupBiasWindowSeconds_);
     } else {
       imuBiasEstimate = {imuBias::ConstantBias(),
-                         "none (" + reason + ", no full-contact packet)", 0};
+                         "none (" + reason + ", no full-contact packet)", 0,
+                         {}, std::nullopt};
+    }
+    if (!biasRecalcAtStart_) {
+      imuBiasEstimate.bias = manualImuBias_;
+      imuBiasEstimate.source = "manual parameters";
+      imuBiasEstimate.sampleCount = 0;
+    }
+
+    if (robotType_ == "spot" && spotForceZeroStartupRollPitch_) {
+      const double configuredYaw =
+          rollPitchYawFromAttitude(replayConfig_.initialAttitude).z();
+      const NavState zeroRollPitchState(
+          Rot3::Ypr(configuredYaw, 0.0, 0.0),
+          replayConfig_.initialPosition, replayConfig_.initialVelocity);
+
+      imuBiasEstimate.initialNavState = zeroRollPitchState;
     }
 
     fs::create_directories(outputDir_);
     RCLCPP_INFO(get_logger(),
                 "Initialized live estimator from %s: buffered_imu=%zu, "
-                "buffered_contacts=%zu, bias_samples=%zu",
+                "buffered_contacts=%zu",
                 reason.c_str(), dataset.imuSamples.size(),
-                dataset.contactEvents.size(), imuBiasEstimate.sampleCount);
+                dataset.contactEvents.size());
+
+    const auto& bias = imuBiasEstimate.bias;
+    RCLCPP_INFO(get_logger(),
+                "[INIT] IMU bias estimate  source='%s'  samples=%zu\n"
+                "       accel_bias = [%.6f, %.6f, %.6f] m/s²\n"
+                "       gyro_bias  = [%.6f, %.6f, %.6f] rad/s",
+                imuBiasEstimate.source.c_str(),
+                imuBiasEstimate.sampleCount,
+                bias.accelerometer().x(), bias.accelerometer().y(), bias.accelerometer().z(),
+                bias.gyroscope().x(),     bias.gyroscope().y(),     bias.gyroscope().z());
+    publishStartTimestampS_ = latestEstimatorTimestampS_;
 
     for (size_t index = 0; index < filterNames_.size(); ++index) {
       const std::string& filterName = filterNames_[index];
       auto runner = std::make_unique<VariantRunner>(
           filterName, metadata_, replayConfig_, maxDurationSeconds_,
-          disableFullContactInitialization_,
+          disableFullContactInitialization_, imuBiasEstimate.initialNavState,
           [this](const std::string& name, double stamp,
-                 const NavState& state) { publishState(name, stamp, state); },
+                 const NavState& state,
+                 const imuBias::ConstantBias& bias,
+                 const Vector3& measuredOmegaBody) {
+            publishState(name, stamp, state, measuredOmegaBody - bias.gyroscope());
+            publishImuBias(name, stamp, bias);
+          },
           [this](const std::string& name, double stamp,
                  const ExtendedPose3d& estimate,
                  const std::vector<ContactMeasurement>& contacts) {
@@ -1002,6 +1438,40 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
     }
   }
 
+  static void writeInitialBiasEstimateRow(
+      std::ofstream& output, const std::string& role,
+      const std::string& source, const size_t sampleCount,
+      const imuBias::ConstantBias& bias) {
+    output << role << ','
+           << source << ','
+           << sampleCount << ','
+           << bias.accelerometer().x() << ','
+           << bias.accelerometer().y() << ','
+           << bias.accelerometer().z() << ','
+           << bias.gyroscope().x() << ','
+           << bias.gyroscope().y() << ','
+           << bias.gyroscope().z() << '\n';
+  }
+
+  static void writeInitialBiasSampleRows(
+      std::ofstream& output, const std::string& role,
+      const std::string& source, const size_t sampleCount,
+      const std::vector<ImuSample>& samples) {
+    for (const ImuSample& sample : samples) {
+      output << role << ','
+             << source << ','
+             << sampleCount << ','
+             << sample.index << ','
+             << sample.timestampS << ','
+             << sample.omega.x() << ','
+             << sample.omega.y() << ','
+             << sample.omega.z() << ','
+             << sample.specificForce.x() << ','
+             << sample.specificForce.y() << ','
+             << sample.specificForce.z() << '\n';
+    }
+  }
+
   void dispatch(const LiveEvent& event) {
     for (std::unique_ptr<VariantRunner>& runner : runners_) {
       runner->processEvent(event);
@@ -1017,18 +1487,24 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
     return stamp;
   }
 
+  Pose3 worldPBase(const NavState& state) const {
+    // The navigation state is located at the base_link origin and its attitude
+    // is world_R_base.
+    return state.pose();
+  }
+
   geometry_msgs::msg::PoseStamped makeBasePoseStamped(
       const builtin_interfaces::msg::Time& stamp,
       const NavState& state) const {
     geometry_msgs::msg::PoseStamped pose;
     pose.header.stamp = stamp;
     pose.header.frame_id = frameId_;
-    const Pose3 worldPBase = state.pose();
-    const Point3 position = worldPBase.translation();
+    const Pose3 worldPBaseLink = worldPBase(state);
+    const Point3 position = worldPBaseLink.translation();
     pose.pose.position.x = position.x();
     pose.pose.position.y = position.y();
     pose.pose.position.z = position.z();
-    const auto quaternion = worldPBase.rotation().toQuaternion();
+    const auto quaternion = worldPBaseLink.rotation().toQuaternion();
     pose.pose.orientation.x = quaternion.x();
     pose.pose.orientation.y = quaternion.y();
     pose.pose.orientation.z = quaternion.z();
@@ -1075,6 +1551,9 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
       const ExtendedPose3d& estimate,
       const std::vector<ContactMeasurement>& contacts) {
     if (!publishFootContacts_) {
+      return;
+    }
+    if (timestampS + 1e-9 < publishStartTimestampS_) {
       return;
     }
 
@@ -1135,7 +1614,10 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
   }
 
   void publishState(const std::string& filterName, double timestampS,
-                    const NavState& state) {
+                    const NavState& state, const Vector3& omegaBody) {
+    if (timestampS + 1e-9 < publishStartTimestampS_) {
+      return;
+    }
     const auto it =
         std::find(filterNames_.begin(), filterNames_.end(), filterName);
     if (it == filterNames_.end()) {
@@ -1151,16 +1633,36 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
     const geometry_msgs::msg::PoseStamped pose =
         makeBasePoseStamped(stamp, state);
     if (publishOdom_) {
-      publishOdometry(index, pose, state);
+      publishOdometry(index, pose, state, omegaBody);
     }
     if (publishPath_) {
       publishPath(index, pose);
     }
   }
 
+  void publishImuBias(const std::string& filterName, double timestampS,
+                      const imuBias::ConstantBias& bias) {
+    if (!imuBiasPublisher_) {
+      return;
+    }
+    legged_estimator_msgs::msg::EstimatorImuBias msg;
+    msg.header.stamp = stampFromSeconds(timestampS);
+    msg.header.frame_id = childFrameId_;
+    msg.filter_name = filterName;
+    const Vector3 accelerometer = bias.accelerometer();
+    const Vector3 gyroscope = bias.gyroscope();
+    msg.accelerometer.x = accelerometer.x();
+    msg.accelerometer.y = accelerometer.y();
+    msg.accelerometer.z = accelerometer.z();
+    msg.gyroscope.x = gyroscope.x();
+    msg.gyroscope.y = gyroscope.y();
+    msg.gyroscope.z = gyroscope.z();
+    imuBiasPublisher_->publish(msg);
+  }
+
   void publishOdometry(size_t index,
                        const geometry_msgs::msg::PoseStamped& pose,
-                       const NavState& state) {
+                       const NavState& state, const Vector3& omegaBody) {
     if (index >= odomPublishers_.size()) {
       return;
     }
@@ -1168,9 +1670,17 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
     msg.header = pose.header;
     msg.child_frame_id = childFrameId_;
     msg.pose.pose = pose.pose;
-    msg.twist.twist.linear.x = state.velocity().x();
-    msg.twist.twist.linear.y = state.velocity().y();
-    msg.twist.twist.linear.z = state.velocity().z();
+
+    const Rot3 worldRBaseLink = state.attitude();
+    const Vector3 baseVelocityBody =
+        worldRBaseLink.unrotate(state.velocity());
+
+    msg.twist.twist.linear.x = baseVelocityBody.x();
+    msg.twist.twist.linear.y = baseVelocityBody.y();
+    msg.twist.twist.linear.z = baseVelocityBody.z();
+    msg.twist.twist.angular.x = omegaBody.x();
+    msg.twist.twist.angular.y = omegaBody.y();
+    msg.twist.twist.angular.z = omegaBody.z();
     odomPublishers_[index]->publish(msg);
   }
 
@@ -1204,7 +1714,12 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
   std::string robotType_ = "spot";
   std::string spotFootTopic_;
   std::string spotFootType_;
+  std::string spotContactClassifier_ = "state";
+#ifdef GTSAM_LEGGED_HAVE_ANYMAL_MSGS
   std::string anymalStateTopic_;
+  std::string anymalContactClassifier_;
+#endif
+  std::string g1LowStateTopic_;
   std::string jointStatesTopic_;
   std::string odomTopicPrefix_;
   std::string frameId_;
@@ -1230,16 +1745,34 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
   DatasetMetadata metadata_;
   double maxDurationSeconds_ = std::numeric_limits<double>::infinity();
   bool disableFullContactInitialization_ = false;
+  bool spotForceZeroStartupRollPitch_ = false;
   double startupBiasWindowSeconds_ = 1.0;
   double startupTimeoutSeconds_ = 5.0;
-
+  bool biasRecalcAtStart_ = true;
+  imuBias::ConstantBias manualImuBias_;
   int qosDepth_ = 1000;
   bool qosReliable_ = false;
   double reorderDelaySeconds_ = 0.02;
 
   rclcpp::Subscription<Imu>::SharedPtr imuSub_;
   rclcpp::Subscription<JointState>::SharedPtr jointStateSub_;
+  rclcpp::Publisher<
+      legged_estimator_msgs::msg::SpotContactDiagnostics>::SharedPtr
+      spotContactDiagnosticsPublisher_;
+  rclcpp::Publisher<
+      legged_estimator_msgs::msg::EstimatorImuBias>::SharedPtr
+      imuBiasPublisher_;
+#ifdef GTSAM_LEGGED_HAVE_ANYMAL_MSGS
   rclcpp::Subscription<anymal_msgs::msg::AnymalState>::SharedPtr anymalStateSub_;
+  rclcpp::Publisher<
+      legged_estimator_msgs::msg::AnymalContactDiagnostics>::SharedPtr
+      anymalContactDiagnosticsPublisher_;
+#endif
+#ifdef GTSAM_LEGGED_HAVE_UNITREE_HG
+  rclcpp::Subscription<unitree_hg::msg::LowState>::SharedPtr g1LowStateSub_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr
+      g1ContactDebugPublisher_;
+#endif
   rclcpp::GenericSubscription::SharedPtr footSub_;
   std::vector<rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr>
       odomPublishers_;
@@ -1254,9 +1787,17 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
   rclcpp::TimerBase::SharedPtr flushTimer_;
 
   bool reportedFootParseError_ = false;
+#ifdef GTSAM_LEGGED_HAVE_ANYMAL_MSGS
   bool reportedAnymalParseError_ = false;
+#endif
+  bool reportedG1ParseError_ = false;
   std::unique_ptr<SpotContactAdapter> spotContactAdapter_;
+#ifdef GTSAM_LEGGED_HAVE_ANYMAL_MSGS
   std::unique_ptr<AnymalContactAdapter> anymalContactAdapter_;
+#endif
+#ifdef GTSAM_LEGGED_HAVE_UNITREE_HG
+  std::unique_ptr<UnitreeG1Adapter> g1Adapter_;
+#endif
 
   std::mutex queueMutex_;
   std::priority_queue<QueuedEvent, std::vector<QueuedEvent>,
@@ -1273,6 +1814,7 @@ class LeggedEstimatorRos2Node : public rclcpp::Node {
 
   std::vector<LiveEvent> startupBuffer_;
   std::vector<std::unique_ptr<VariantRunner>> runners_;
+  double publishStartTimestampS_ = -std::numeric_limits<double>::infinity();
   bool initialized_ = false;
   bool finished_ = false;
 };

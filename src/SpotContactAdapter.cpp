@@ -1,4 +1,5 @@
 #include "include/SpotContactAdapter.h"
+#include "include/JointTorqueGrfEstimator.h"
 
 #include <rclcpp/serialization.hpp>
 #include <rclcpp/time.hpp>
@@ -12,10 +13,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <new>
+#include <deque>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -156,18 +160,57 @@ class SpotContactAdapter::Impl {
       throw std::runtime_error(
           "Spot contact adapter fkPositionIndices must contain 12 values");
     }
+    std::transform(options_.contactClassifier.begin(),
+                   options_.contactClassifier.end(),
+                   options_.contactClassifier.begin(), [](unsigned char c) {
+                     return static_cast<char>(std::tolower(c));
+                   });
+    if (options_.contactClassifier != "state" &&
+        options_.contactClassifier != "joint_torque_grf") {
+      throw std::runtime_error(
+          "Spot contact classifier must be 'state' or 'joint_torque_grf'");
+    }
+    if (options_.contactClassifier == "joint_torque_grf") {
+      if (options_.contactForceWindowSize < 1 ||
+          options_.contactOnSamples < 1 ||
+          options_.contactForceDeltaOffSamples < 1 ||
+          options_.contactForceOff > options_.contactForceOn ||
+          !std::isfinite(options_.contactPointZOffset)) {
+        throw std::runtime_error(
+            "Invalid Spot joint-torque GRF contact classifier parameters");
+      }
+      jointTorqueGrfEstimator_ = std::make_unique<JointTorqueGrfEstimator>(
+          options_.jointTorqueGrfDamping, options_.jointTorqueScale,
+          options_.urdfPath, "spot");
+    }
 
     setupFootTypeSupport();
     inContact_.assign(options_.footNames.size(), false);
     previousContactSet_.assign(options_.footNames.size(), false);
+    forceStates_.resize(options_.footNames.size());
   }
 
   const std::string& footType() const { return options_.footType; }
+  bool usesFootContactMessages() const {
+    return options_.contactClassifier == "state";
+  }
 
   void updateJointState(const sensor_msgs::msg::JointState& msg) {
+    latestJointState_ = msg;
     latestJointPositions_.assign(msg.position.begin(), msg.position.end());
     lastJointTimestampS_ = rclcpp::Time(msg.header.stamp).seconds();
     haveJointState_ = true;
+  }
+
+  std::optional<ContactEvent> makeJointTorqueGrfContactEvent(
+      const sensor_msgs::msg::JointState& msg, const size_t eventIndex,
+      Diagnostics* diagnostics) {
+    updateJointState(msg);
+    if (options_.contactClassifier != "joint_torque_grf") {
+      return std::nullopt;
+    }
+    return makeJointTorqueGrfContactEvent(lastJointTimestampS_, eventIndex,
+                                          diagnostics);
   }
 
   std::optional<ContactEvent> makeContactEvent(
@@ -181,11 +224,11 @@ class SpotContactAdapter::Impl {
   void setupFootTypeSupport() {
     cppTypeSupportLibrary_ = rclcpp::get_typesupport_library(
         options_.footType, "rosidl_typesupport_cpp");
-    cppTypeSupport_ = rclcpp::get_message_typesupport_handle(
+    cppTypeSupport_ = rclcpp::get_typesupport_handle(
         options_.footType, "rosidl_typesupport_cpp", *cppTypeSupportLibrary_);
     introspectionTypeSupportLibrary_ = rclcpp::get_typesupport_library(
         options_.footType, "rosidl_typesupport_introspection_cpp");
-    introspectionTypeSupport_ = rclcpp::get_message_typesupport_handle(
+    introspectionTypeSupport_ = rclcpp::get_typesupport_handle(
         options_.footType, "rosidl_typesupport_introspection_cpp",
         *introspectionTypeSupportLibrary_);
     footMembers_ = static_cast<const introspection::MessageMembers*>(
@@ -197,6 +240,9 @@ class SpotContactAdapter::Impl {
   std::optional<ContactEvent> parseFootMessage(const void* message,
                                                const size_t eventIndex) {
     const double timestampS = stampToSec(message, footMembers_);
+    if (options_.contactClassifier == "joint_torque_grf") {
+      return makeJointTorqueGrfContactEvent(timestampS, eventIndex);
+    }
     const introspection::MessageMember* statesMember =
         findMember(footMembers_, "states");
     if (statesMember == nullptr || !statesMember->is_array_ ||
@@ -269,6 +315,111 @@ class SpotContactAdapter::Impl {
     return event;
   }
 
+  struct ForceState {
+    bool active = false;
+    std::optional<double> previousForce;
+    std::deque<double> deltas;
+    size_t onCount = 0;
+    size_t offCount = 0;
+  };
+
+  bool classifyForce(const double force, const size_t foot) {
+    ForceState& state = forceStates_.at(foot);
+    if (!std::isfinite(force)) {
+      state = ForceState{};
+      return false;
+    }
+    std::optional<double> delta;
+    if (state.previousForce) {
+      delta = std::abs(force - *state.previousForce);
+      state.deltas.push_back(*delta);
+      while (state.deltas.size() > options_.contactForceWindowSize) {
+        state.deltas.pop_front();
+      }
+    }
+    state.previousForce = force;
+    if (state.active) {
+      const bool unstable = !delta || *delta > options_.contactMaxForceDelta;
+      state.offCount = unstable ? state.offCount + 1 : 0;
+      state.active = force > options_.contactForceOff &&
+                     state.offCount < options_.contactForceDeltaOffSamples;
+      if (!state.active) {
+        state.onCount = 0;
+        state.offCount = 0;
+      }
+      return state.active;
+    }
+    bool stable = delta && *delta <= options_.contactMaxForceDelta;
+    if (options_.contactUseForceWindow) {
+      stable = state.deltas.size() == options_.contactForceWindowSize;
+      for (const double value : state.deltas) {
+        stable = stable && value <= options_.contactMaxForceDelta;
+      }
+    }
+    state.onCount = force >= options_.contactForceOn && stable
+                        ? state.onCount + 1
+                        : 0;
+    state.active = state.onCount >= options_.contactOnSamples;
+    if (state.active) {
+      state.onCount = 0;
+      state.offCount = 0;
+    }
+    return state.active;
+  }
+
+  std::optional<ContactEvent> makeJointTorqueGrfContactEvent(
+      const double timestampS, const size_t eventIndex,
+      Diagnostics* diagnostics = nullptr) {
+    if (!haveJointState_ ||
+        (options_.jointFkMaxJointAgeSeconds > 0.0 &&
+         std::abs(timestampS - lastJointTimestampS_) >
+             options_.jointFkMaxJointAgeSeconds)) {
+      return std::nullopt;
+    }
+    const auto estimates =
+        jointTorqueGrfEstimator_->estimate(latestJointState_, options_.footNames);
+    if (diagnostics != nullptr) {
+      diagnostics->feet.clear();
+      diagnostics->feet.reserve(estimates.size());
+    }
+    std::vector<ContactMeasurement> contacts;
+    for (size_t foot = 0; foot < estimates.size(); ++foot) {
+      const auto& estimate = estimates[foot];
+      const double force =
+          estimate.valid
+              ? (options_.contactUseAbsoluteForceZ
+                     ? std::abs(estimate.bodyGroundReactionForce.z())
+                     : estimate.bodyGroundReactionForce.z())
+              : std::numeric_limits<double>::quiet_NaN();
+      const bool wasActive = forceStates_[foot].active;
+      const bool active = classifyForce(force, foot);
+      if (diagnostics != nullptr) {
+        diagnostics->feet.push_back({
+            options_.footNames[foot], estimate.valid,
+            estimate.valid ? estimate.bodyGroundReactionForce.z() : 0.0,
+            estimate.valid ? force : 0.0, active});
+      }
+      if (!active || !estimate.valid) {
+        continue;
+      }
+      ContactMeasurement measurement;
+      measurement.foot = foot;
+      measurement.bodyPoint =
+          estimate.bodyFootPosition + options_.legImuOffsets.at(foot);
+      measurement.bodyPoint.z() += options_.contactPointZOffset;
+      measurement.touchdown = !wasActive;
+      contacts.push_back(measurement);
+    }
+    if (contacts.empty()) {
+      return std::nullopt;
+    }
+    ContactEvent event;
+    event.index = eventIndex;
+    event.timestampS = timestampS;
+    event.activeContacts = std::move(contacts);
+    return event;
+  }
+
   Vector3 readFootBodyPoint(
       const void* state,
       const introspection::MessageMembers* stateMembers) const {
@@ -334,11 +485,14 @@ class SpotContactAdapter::Impl {
   const introspection::MessageMembers* footMembers_ = nullptr;
   std::unique_ptr<rclcpp::SerializationBase> serialization_;
   std::vector<double> latestJointPositions_;
+  sensor_msgs::msg::JointState latestJointState_;
   bool haveJointState_ = false;
   double lastJointTimestampS_ = 0.0;
   std::vector<bool> inContact_;
   std::vector<bool> previousContactSet_;
   bool havePreviousContactSet_ = false;
+  std::unique_ptr<JointTorqueGrfEstimator> jointTorqueGrfEstimator_;
+  std::vector<ForceState> forceStates_;
 };
 
 SpotContactAdapter::SpotContactAdapter(Options options)
@@ -350,9 +504,19 @@ const std::string& SpotContactAdapter::footType() const {
   return impl_->footType();
 }
 
+bool SpotContactAdapter::usesFootContactMessages() const {
+  return impl_->usesFootContactMessages();
+}
+
 void SpotContactAdapter::updateJointState(
     const sensor_msgs::msg::JointState& msg) {
   impl_->updateJointState(msg);
+}
+
+std::optional<ContactEvent> SpotContactAdapter::makeJointTorqueGrfContactEvent(
+    const sensor_msgs::msg::JointState& msg, const size_t eventIndex,
+    Diagnostics* diagnostics) {
+  return impl_->makeJointTorqueGrfContactEvent(msg, eventIndex, diagnostics);
 }
 
 std::optional<ContactEvent> SpotContactAdapter::makeContactEvent(
