@@ -1,0 +1,29 @@
+services:
+  gtsam_legged_estimator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ROS_DISTRO: ${ROS_DISTRO:-jazzy}
+        GTSAM_GIT_REF: ${GTSAM_GIT_REF:-develop}
+        USER_UID: ${HOST_UID:-1000}
+        USER_GID: ${HOST_GID:-1000}
+
+    container_name: gtsam_legged_estimator
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+
+    # This package is mounted as a single package under src/, so colcon
+    # build only needs to build it (and whatever else is placed alongside).
+    volumes:
+      - .:/ros2_ws/src/GTSAM-Legged-Estimator-ROS2
+
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-12}
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+    working_dir: /ros2_ws
+
+    stdin_open: true
+    tty: true
+
+    network_mode: host
